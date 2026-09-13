@@ -1,3 +1,10 @@
+## [1.2.2](https://github.com/Banten-IT-Solutions/BITS-XL/compare/v1.2.1...v1.2.2) (2026-09-13)
+
+
+### Bug Fixes
+
+* drop non-existent python3-json/hashlib/ssl deps (bundled in python3-light) ([a6093e3](https://github.com/Banten-IT-Solutions/BITS-XL/commit/a6093e3007ab232f0cf1a356c2b75e8f3d30da2b))
+
 ## [1.2.1](https://github.com/Banten-IT-Solutions/BITS-XL/compare/v1.2.0...v1.2.1) (2026-09-13)
 
 
