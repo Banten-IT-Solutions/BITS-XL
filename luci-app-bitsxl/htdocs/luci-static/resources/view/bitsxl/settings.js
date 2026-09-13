@@ -26,11 +26,10 @@ const SOFT_LINE = 'rgba(127,127,127,.16)';
 const SOFT_BORDER = 'linear-gradient(transparent,transparent) padding-box,linear-gradient(135deg,rgba(127,127,127,.26),rgba(127,127,127,.08),rgba(127,127,127,.20)) border-box';
 
 function pageTitle(title) {
-	const main = document.getElementById('maincontent');
 	const tabmenu = document.getElementById('tabmenu');
-	if (!main || !tabmenu || main.querySelector('.bitsxl-page-title'))
+	if (!tabmenu || tabmenu.parentNode.querySelector('.bitsxl-page-title'))
 		return;
-	main.insertBefore(E('div', { 'class': 'bitsxl-page-title' }, [
+	tabmenu.parentNode.insertBefore(E('div', { 'class': 'bitsxl-page-title' }, [
 		E('h2', { 'name': 'content', 'style': 'margin:0 0 .35em' }, title),
 		E('div', { 'style': 'border-top:1px solid ' + SOFT_LINE + ';margin:0 0 1em' })
 	]), tabmenu);
