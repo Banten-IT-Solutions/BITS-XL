@@ -24,17 +24,6 @@ const DECOY_PAIRS = [
 const ENV_WARNING = _('!! Jangan ubah konfigurasi ini jika bukan profesional. Nilai salah dapat membuat login dan cek kuota gagal.');
 const SOFT_LINE = 'rgba(127,127,127,.16)';
 const SOFT_BORDER = 'linear-gradient(transparent,transparent) padding-box,linear-gradient(135deg,rgba(127,127,127,.26),rgba(127,127,127,.08),rgba(127,127,127,.20)) border-box';
-
-function pageTitle(title) {
-	const tabmenu = document.getElementById('tabmenu');
-	if (!tabmenu || tabmenu.parentNode.querySelector('.bitsxl-page-title'))
-		return;
-	tabmenu.parentNode.insertBefore(E('div', { 'class': 'bitsxl-page-title' }, [
-		E('h2', { 'name': 'content', 'style': 'margin:0 0 .35em' }, title),
-		E('div', { 'style': 'border-top:1px solid ' + SOFT_LINE + ';margin:0 0 1em' })
-	]), tabmenu);
-}
-
 function utf8Length(value) {
 	try {
 		return encodeURIComponent(value).replace(/%[0-9A-F]{2}/gi, 'x').length;
@@ -104,7 +93,6 @@ return view.extend({
 	},
 
 	render() {
-		pageTitle(_('Settings'));
 		let m, s, o;
 
 		m = new form.Map('bitsxl', _('BITS XL Settings'));

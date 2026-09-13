@@ -42,17 +42,6 @@ function notifyResult(res, okText) {
 	else
 		ui.addNotification(null, E('p', {}, (res && (res.error || res.message)) || _('Command failed.')), 'warning');
 }
-
-function pageTitle(title) {
-	const tabmenu = document.getElementById('tabmenu');
-	if (!tabmenu || tabmenu.parentNode.querySelector('.bitsxl-page-title'))
-		return;
-	tabmenu.parentNode.insertBefore(E('div', { 'class': 'bitsxl-page-title' }, [
-		E('h2', { 'name': 'content', 'style': 'margin:0 0 .35em' }, title),
-		E('div', { 'style': 'border-top:1px solid ' + SOFT_LINE + ';margin:0 0 1em' })
-	]), tabmenu);
-}
-
 function copyText(text, ev) {
 	if (ev) {
 		ev.preventDefault();
@@ -1584,7 +1573,6 @@ return view.extend({
 	},
 
 	render(results) {
-		pageTitle(_('Dashboard'));
 		const data = results[0] || {};
 		const accounts = {
 			lazy: true,
@@ -1599,6 +1587,7 @@ return view.extend({
 		const quota = quotaData(data);
 		const summary = quotaSummary(quota);
 		return E('div', { 'class': 'cbi-map' }, [
+			E('h2', { 'name': 'content' }, _('Dashboard')),
 			data.ok ? E('div', { 'class': 'cbi-section' }, [
 				E('div', { 'style': 'text-align:center;margin-bottom:1em' }, [
 					statLabel(_('Number')),

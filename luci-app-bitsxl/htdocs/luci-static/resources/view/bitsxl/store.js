@@ -55,17 +55,6 @@ let searchUpdate = null;
 function callBitsxl(args) {
 	return L.resolveDefault(fs.exec_direct(BIN, args, 'json'), { ok: false, error: _('Unable to execute bitsxl') });
 }
-
-function pageTitle(title) {
-	const tabmenu = document.getElementById('tabmenu');
-	if (!tabmenu || tabmenu.parentNode.querySelector('.bitsxl-page-title'))
-		return;
-	tabmenu.parentNode.insertBefore(E('div', { 'class': 'bitsxl-page-title' }, [
-		E('h2', { 'name': 'content', 'style': 'margin:0 0 .35em' }, title),
-		E('div', { 'style': 'border-top:1px solid ' + SOFT_LINE + ';margin:0 0 1em' })
-	]), tabmenu);
-}
-
 function notifyResult(res, okText) {
 	if (res && res.ok)
 		ui.addNotification(null, E('p', {}, okText || _('Done.')), 'info');
@@ -1781,7 +1770,6 @@ return view.extend({
 	},
 
 	render(data) {
-		pageTitle(_('Store'));
 		resetCartPointerDrag(false);
 		cartModalBox = null;
 		setStoreScopeFromRoute();
@@ -1795,6 +1783,7 @@ return view.extend({
 		renderFloatingCart();
 		window.setTimeout(renderShopContent, 0);
 		return E('div', { 'class': 'cbi-map' }, [
+			E('h2', { 'name': 'content' }, _('Store')),
 			data && data.ok ? contentBox : E('div', { 'class': 'alert-message warning' }, data && data.error || _('Failed to load store.')),
 			cartFloatBox
 		]);

@@ -16,17 +16,6 @@ const TX_KEYS = [ 'transaction_id', 'transaction_code', 'trx_code', 'reference_i
 function callBitsxl(args) {
 	return L.resolveDefault(fs.exec_direct(BIN, args, 'json'), { ok: false, error: _('Unable to execute bitsxl') });
 }
-
-function pageTitle(title) {
-	const tabmenu = document.getElementById('tabmenu');
-	if (!tabmenu || tabmenu.parentNode.querySelector('.bitsxl-page-title'))
-		return;
-	tabmenu.parentNode.insertBefore(E('div', { 'class': 'bitsxl-page-title' }, [
-		E('h2', { 'name': 'content', 'style': 'margin:0 0 .35em' }, title),
-		E('div', { 'style': 'border-top:1px solid ' + SOFT_LINE + ';margin:0 0 1em' })
-	]), tabmenu);
-}
-
 function logText(value) {
 	if (value == null)
 		return '';
@@ -643,7 +632,7 @@ function quotaHistoryPage(data) {
 	const snapshot = quotaSnapshot(data);
 	if (!snapshot) {
 		return E('div', { 'class': 'cbi-map' }, [
-			E('h2', {}, _('Kuota History')),
+			E('h2', { 'name': 'content' }, _('Kuota History')),
 			E('div', { 'class': 'alert-message warning' }, (data && (data.error || data.message)) || _('No quota snapshot yet. Use Check All Number Kuota from the account popup.'))
 		]);
 	}
@@ -663,7 +652,7 @@ function quotaHistoryPage(data) {
 		].join('')),
 		E('div', { 'style': 'display:flex;justify-content:space-between;gap:1em;align-items:center;flex-wrap:wrap' }, [
 			E('div', {}, [
-				E('h2', { 'style': 'margin:0' }, _('Kuota History')),
+				E('h2', { 'name': 'content' }, _('Kuota History')),
 				E('div', { 'style': 'margin-top:.25em;color:inherit;opacity:.62' }, snapshot.checked_at ? formatDate(snapshot.checked_at) : '')
 			]),
 			E('div', { 'class': 'bitsxl-quota-history-actions' }, [
@@ -765,7 +754,7 @@ function transactionHistoryPage(data) {
 	return E('div', { 'class': 'cbi-map' }, [
 		E('div', { 'style': 'display:flex;justify-content:space-between;gap:1em;align-items:center;flex-wrap:wrap' }, [
 			E('div', {}, [
-				E('h2', { 'style': 'margin:0' }, _('Riwayat')),
+				E('h2', { 'name': 'content' }, _('Riwayat')),
 				E('div', { 'style': 'margin-top:.25em;color:inherit;opacity:.65' }, _('Transaction History'))
 			]),
 			E('div', { 'style': 'display:flex;gap:.45em;flex-wrap:wrap' }, [
@@ -784,7 +773,7 @@ function paymentLogsPage() {
 	return E('div', { 'class': 'cbi-map' }, [
 		E('div', { 'style': 'display:flex;justify-content:space-between;gap:1em;align-items:center;flex-wrap:wrap' }, [
 			E('div', {}, [
-				E('h2', { 'style': 'margin:0' }, _('Riwayat')),
+				E('h2', { 'name': 'content' }, _('Riwayat')),
 				E('div', { 'style': 'margin-top:.25em;color:inherit;opacity:.65' }, _('Logs'))
 			]),
 		E('button', { 'class': 'btn cbi-button cbi-button-reload', 'style': 'margin-top:1em', 'click': () => window.location.reload() }, _('Refresh'))
@@ -807,7 +796,6 @@ return view.extend({
 
 	render(data) {
 		const mode = currentMode();
-		pageTitle(mode === 'logs' ? _('Logs') : (mode === 'quota-history' ? _('Kuota History') : _('Transaction History')));
 		return mode === 'logs' ? paymentLogsPage() : (mode === 'quota-history' ? quotaHistoryPage(data) : transactionHistoryPage(data));
 	},
 

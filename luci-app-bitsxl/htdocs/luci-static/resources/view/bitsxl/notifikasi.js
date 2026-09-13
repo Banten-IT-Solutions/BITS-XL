@@ -10,17 +10,6 @@ const SOFT_BORDER = 'linear-gradient(transparent,transparent) padding-box,linear
 function callBitsxl(args) {
 	return L.resolveDefault(fs.exec_direct(BIN, args, 'json'), { ok: false, error: _('Unable to execute bitsxl') });
 }
-
-function pageTitle(title) {
-	const tabmenu = document.getElementById('tabmenu');
-	if (!tabmenu || tabmenu.parentNode.querySelector('.bitsxl-page-title'))
-		return;
-	tabmenu.parentNode.insertBefore(E('div', { 'class': 'bitsxl-page-title' }, [
-		E('h2', { 'name': 'content', 'style': 'margin:0 0 .35em' }, title),
-		E('div', { 'style': 'border-top:1px solid ' + SOFT_LINE + ';margin:0 0 1em' })
-	]), tabmenu);
-}
-
 function notificationList(payload) {
 	const roots = [ payload, payload && payload.notifications, payload && payload.response ];
 
@@ -180,7 +169,6 @@ return view.extend({
 	},
 
 	render(data) {
-		pageTitle(_('Notifikasi'));
 		const items = notificationList(data);
 		const ids = unreadIds(items);
 		const unread = items.filter((item) => !notificationRead(item)).length;
@@ -188,7 +176,7 @@ return view.extend({
 		return E('div', { 'class': 'cbi-map' }, [
 			E('div', { 'style': 'display:flex;justify-content:space-between;gap:1em;align-items:center;flex-wrap:wrap' }, [
 				E('div', {}, [
-					E('h2', { 'style': 'margin:0' }, _('Notifikasi')),
+					E('h2', { 'name': 'content' }, _('Notifikasi')),
 					E('div', { 'style': 'margin-top:.25em;color:inherit;opacity:.65' }, _('Total') + ': ' + items.length + ' · ' + _('Unread') + ': ' + unread)
 				]),
 				E('div', { 'style': 'display:flex;gap:.45em;flex-wrap:wrap' }, [
