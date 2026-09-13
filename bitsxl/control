@@ -1,6 +1,6 @@
 Package: bitsxl
 Version: 1.2.1
-Depends: libc, python3-light, python3-urllib, python3-json, python3-hashlib, python3-ssl, python3-pip, ca-certificates
+Depends: libc, python3-light, python3-urllib, python3-pip, ca-certificates
 Section: utils
 Architecture: all
 Maintainer: Banten IT Solutions <support@bits.co.id>
