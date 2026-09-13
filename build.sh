@@ -16,8 +16,8 @@ rm -rf .build dist
 mkdir -p .build/root .build/control .build/outer dist
 
 # htdocs -> /www ; root -> /
-cp -a package/luci-app-bitsxl/htdocs/. .build/root/www/
-cp -a package/luci-app-bitsxl/root/.   .build/root/
+cp -a luci-app-bitsxl/htdocs/. .build/root/www/
+cp -a luci-app-bitsxl/root/.   .build/root/
 
 # ===== .ipk (opkg) =====
 cp control .build/control/control

@@ -41,7 +41,7 @@
 | **Runtime**  | OpenWrt (LuCI)                                                                    |
 | **Backend**  | C (`bitsxl`) + `rpcd` ACL + `uci`                                                 |
 | **Frontend** | JavaScript (LuCI AMD views loaded via `require`)                                  |
-| **Build**    | `bash` + `tar` (ipk) + `apk-tools v3` (apk) — no SDK for the LuCI package        |
+| **Build**    | `bash` + `tar` (ipk) + `apk-tools v3` (apk) — no SDK                            |
 | **Release**  | semantic-release + GitHub Actions                                                 |
 
 ---
@@ -51,31 +51,24 @@
 ```text
 BITS-XL/
 ├── .github/
-│   ├── ci/                        # native C contract + transport tests
 │   ├── dependabot.yml             # dep update (npm + actions)
-│   └── workflows/
-│       ├── release.yml            # semantic-release + build .ipk/.apk + attach asset
-│       └── openwrt-apk.yml        # SDK matrix (native bitsxl backend, per-arch)
-├── package/
-│   ├── luci-app-bitsxl/
-│   │   ├── htdocs/
-│   │   │   └── luci-static/resources/view/bitsxl/
-│   │   │       ├── dashboard-segments.js
-│   │   │       ├── store.js
-│   │   │       ├── riwayat-logs.js
-│   │   │       ├── notifikasi.js
-│   │   │       └── settings.js
-│   │   └── root/
-│   │       └── usr/share/
-│   │           ├── luci/menu.d/luci-app-bitsxl.json
-│   │           └── rpcd/acl.d/luci-app-bitsxl.json
-│   └── openwrt/                   # native bitsxl backend OpenWrt package
-│       ├── Makefile
-│       └── files/
-├── src/
-│   └── bitsxl.c                  # native backend source
-├── scripts/
-│   └── prepare.js                # sync version + build .ipk/.apk (semantic-release)
+    │   └── workflows/
+    │       └── release.yml            # semantic-release + build .ipk/.apk + attach asset
+    ├── luci-app-bitsxl/
+    │   ├── htdocs/
+    │   │   └── luci-static/resources/view/bitsxl/
+    │   │       ├── dashboard-segments.js
+    │   │       ├── store.js
+    │   │       ├── riwayat-logs.js
+    │   │       ├── notifikasi.js
+    │   │       └── settings.js
+    │   └── root/
+    │       ├── etc/config/bitsxl
+    │       └── usr/share/
+    │           ├── luci/menu.d/luci-app-bitsxl.json
+    │           └── rpcd/acl.d/luci-app-bitsxl.json
+    ├── scripts/
+    │   └── prepare.js                # sync version + build .ipk/.apk (semantic-release)
 ├── build.sh                      # SDK-less .ipk + .apk packer (bash + tar + apk-tools)
 ├── control                       # ipk metadata
 ├── postinst                      # reload ACL/menu
@@ -129,8 +122,6 @@ bitsxl otp 081234567890 123456
 
 ## 🏗️ Build
 
-### Frontend (SDK-less)
-
 SDK-less `.ipk` + `.apk`. Butuh `apk-tools v3` (`apk mkpkg`) di `PATH`. Di CI sudah di-cache; lokal install `apk-tools` 3.x atau set `APK_BIN=<path/to/apk>`.
 
 ```sh
@@ -140,15 +131,8 @@ SDK-less `.ipk` + `.apk`. Butuh `apk-tools v3` (`apk mkpkg`) di `PATH`. Di CI su
 ```
 
 > `.ipk` = outer `tar.gz` (debian-binary + control.tar.gz + data.tar.gz). `.apk` = ADB container via `apk mkpkg`.
-
-### Backend (native, per-arch)
-
-The `bitsxl` binary is cross-compiled per architecture via the OpenWrt SDK matrix (`openwrt-apk.yml`, manual `workflow_dispatch`) and published to the BITS feed.
-
-```sh
-make
-make clean
-```
+>
+> The `bitsxl` native backend binary is shipped separately via the BITS feed (`BITS-WRT-Packages`).
 
 ---
 
