@@ -1,3 +1,10 @@
+## [1.2.3](https://github.com/Banten-IT-Solutions/BITS-XL/compare/v1.2.2...v1.2.3) (2026-09-13)
+
+
+### Bug Fixes
+
+* show page title above tab strip + spacing for refresh buttons ([f393d29](https://github.com/Banten-IT-Solutions/BITS-XL/commit/f393d297b358cc9842d6f45ad5c885fe698295b5))
+
 ## [1.2.2](https://github.com/Banten-IT-Solutions/BITS-XL/compare/v1.2.1...v1.2.2) (2026-09-13)
 
 
