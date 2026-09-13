@@ -1,3 +1,10 @@
+## [1.1.1](https://github.com/Banten-IT-Solutions/BITS-XL/compare/v1.1.0...v1.1.1) (2026-09-13)
+
+
+### Bug Fixes
+
+* trigger bitsxl backend build via workflow_run (avoid GITHUB_TOKEN chained-workflow limit) ([6d1d9a6](https://github.com/Banten-IT-Solutions/BITS-XL/commit/6d1d9a66b5aa3573e2aacfa278feb81c44e94feb))
+
 # [1.1.0](https://github.com/Banten-IT-Solutions/BITS-XL/compare/v1.0.0...v1.1.0) (2026-09-13)
 
 
