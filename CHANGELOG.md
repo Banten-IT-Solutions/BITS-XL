@@ -1,3 +1,10 @@
+## [1.2.1](https://github.com/Banten-IT-Solutions/BITS-XL/compare/v1.2.0...v1.2.1) (2026-09-13)
+
+
+### Bug Fixes
+
+* add python3-pip dep (postinst installs pycryptodome via pip) ([e5f7ff4](https://github.com/Banten-IT-Solutions/BITS-XL/commit/e5f7ff4e8d658187a81f30022a4c954822c622db))
+
 # [1.2.0](https://github.com/Banten-IT-Solutions/BITS-XL/compare/v1.1.1...v1.2.0) (2026-09-13)
 
 
