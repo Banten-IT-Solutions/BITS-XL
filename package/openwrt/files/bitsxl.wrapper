@@ -1,0 +1,60 @@
+#!/bin/sh
+REAL=/usr/libexec/bitsxl/bitsxl
+ENV=/etc/bitsxl/.env
+CONFIG=/etc/config/bitsxl
+STAMP=/etc/bitsxl/.uci.sha256
+CACHE=/tmp/bitsxl-cache
+KEYS="BASE_API_URL BASE_CIAM_URL BASIC_AUTH AX_FP_KEY UA API_KEY ENCRYPTED_FIELD_KEY XDATA_KEY AX_API_SIG_KEY X_API_BASE_SECRET DECOY_PREPAID_FAMILY_CODE DECOY_PREPAID_PACKAGE_NUMBER DECOY_PRIORITAS_FAMILY_CODE DECOY_PRIORITAS_PACKAGE_NUMBER DECOY_PRIOHYBRID_FAMILY_CODE DECOY_PRIOHYBRID_PACKAGE_NUMBER"
+
+sync_env=0
+[ -f "$ENV" ] || sync_env=1
+config_sig=
+saved_sig=
+if [ -f "$CONFIG" ]; then
+	if command -v sha256sum >/dev/null 2>&1; then
+		config_sig="$(sha256sum < "$CONFIG" 2>/dev/null)" || exit 1
+		if [ -f "$STAMP" ]; then
+			IFS= read -r saved_sig < "$STAMP" || saved_sig=
+		fi
+		[ -n "$config_sig" ] && [ "$config_sig" != "$saved_sig" ] && sync_env=1
+	elif [ "$CONFIG" -nt "$ENV" ]; then
+		sync_env=1
+	fi
+fi
+
+if [ "$sync_env" -eq 1 ] && command -v uci >/dev/null 2>&1 && uci -q get bitsxl.config >/dev/null 2>&1; then
+	umask 077
+	mkdir -p /etc/bitsxl || exit 1
+	tmp="$ENV.$$"
+	stamp_tmp="$STAMP.$$"
+	cleanup() {
+		[ -z "$tmp" ] || rm -f "$tmp"
+		[ -z "$stamp_tmp" ] || rm -f "$stamp_tmp"
+	}
+	trap cleanup 0
+	trap 'cleanup; exit 1' 1 2 3 15
+	if ! {
+		for key in $KEYS; do
+			value="$(uci -q get bitsxl.config.$key 2>/dev/null)" || value=
+			[ -n "$value" ] || continue
+			printf '%s=%s\n' "$key" "$value" || exit 1
+		done
+	} > "$tmp"; then
+		exit 1
+	fi
+	mv "$tmp" "$ENV" || exit 1
+	if [ -n "$config_sig" ]; then
+		printf '%s\n' "$config_sig" > "$stamp_tmp" || exit 1
+		mv "$stamp_tmp" "$STAMP" || exit 1
+	fi
+	rm -rf "$CACHE"
+	tmp=
+	stamp_tmp=
+	trap - 0 1 2 3 15
+fi
+
+if [ -f "$ENV" ]; then
+	export BITSXL_ENV="$ENV"
+fi
+
+exec "$REAL" "$@"

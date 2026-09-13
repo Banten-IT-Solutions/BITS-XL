@@ -118,6 +118,12 @@ bitsxl login 081234567890
 bitsxl otp 081234567890 123456
 ```
 
+### 4. Configuration
+
+Default XL API credentials ship with the backend package at `/etc/config/bitsxl`. Optional Decoy overrides (`Services → BITS XL → Settings → Decoy`):
+
+`DECOY_PREPAID_FAMILY_CODE`, `DECOY_PREPAID_PACKAGE_NUMBER`, `DECOY_PRIORITAS_FAMILY_CODE`, `DECOY_PRIORITAS_PACKAGE_NUMBER`, `DECOY_PRIOHYBRID_FAMILY_CODE`, `DECOY_PRIOHYBRID_PACKAGE_NUMBER` — leave blank to use built-in decoys.
+
 ---
 
 ## 🏗️ Build

@@ -10,6 +10,8 @@ if (!version) {
   process.exit(1);
 }
 
+const packages = ['luci-app-bitsxl'];
+
 // 1) bump package.json + package-lock.json (manual, toleran same-version)
 const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
 pkg.version = version;
@@ -25,9 +27,11 @@ if (fs.existsSync('package-lock.json')) {
 }
 
 // 2) bump control (ipk + apk membaca Version dari control)
-let control = fs.readFileSync('control', 'utf8');
-control = control.replace(/^Version: .*$/m, `Version: ${version}`);
-fs.writeFileSync('control', control);
+for (const name of packages) {
+  let control = fs.readFileSync(`${name}/control`, 'utf8');
+  control = control.replace(/^Version: .*$/m, `Version: ${version}`);
+  fs.writeFileSync(`${name}/control`, control);
+}
 
 // 3) build .ipk + .apk (build.sh membaca metadata dari control)
 execSync('bash build.sh', { stdio: 'inherit' });
