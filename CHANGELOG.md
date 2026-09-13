@@ -1,3 +1,10 @@
+## [1.2.5](https://github.com/Banten-IT-Solutions/BITS-XL/compare/v1.2.4...v1.2.5) (2026-09-13)
+
+
+### Bug Fixes
+
+* standard h2 title style + remove duplicate horizontal line ([10c8617](https://github.com/Banten-IT-Solutions/BITS-XL/commit/10c8617604613bbba68aef18b77831e0e09ca530))
+
 ## [1.2.4](https://github.com/Banten-IT-Solutions/BITS-XL/compare/v1.2.3...v1.2.4) (2026-09-13)
 
 
