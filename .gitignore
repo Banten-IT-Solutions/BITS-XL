@@ -3,5 +3,6 @@ dist/
 *.ipk
 *.apk
 node_modules/
-*.o
-/bitsxl
+__pycache__/
+*.pyc
+.ruff_cache/

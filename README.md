@@ -13,7 +13,7 @@
     <img src="https://img.shields.io/badge/OpenWrt-00A1E9?style=flat&logo=openwrt&logoColor=white" alt="OpenWrt" />
     <img src="https://img.shields.io/badge/LuCI-3D5780?style=flat" alt="LuCI" />
     <img src="https://img.shields.io/badge/XL-FF2D55?style=flat" alt="XL" />
-    <img src="https://img.shields.io/badge/C-00599C?style=flat&logo=c&logoColor=white" alt="C" />
+    <img src="https://img.shields.io/badge/Python-3776AB?style=flat&logo=python&logoColor=white" alt="Python" />
     <img src="https://img.shields.io/badge/JavaScript-F7DF1E?style=flat&logo=javascript&logoColor=black" alt="JavaScript" />
     <img src="https://img.shields.io/badge/license-MIT-green?style=flat" alt="MIT License" />
   </p>
@@ -30,7 +30,7 @@
 | **Riwayat**               | Transaction history, `Kuota History`, and logs viewer with recheck actions.                                    |
 | **Notifikasi**            | XL notifications and detail viewer.                                                                             |
 | **Settings**              | Environment (API keys) and custom Decoy pairs managed from LuCI.                                                |
-| **Native C Backend**      | `bitsxl` binary (curllib + mbedtls), no Python runtime on the router.                                            |
+| **Python Backend**        | `bitsxl` CLI (urllib + pycryptodome AES + hmac signing).                                                        |
 | **Services Menu**         | Lives under `Services → BITS XL`.                                                                               |
 | **Automated Release**     | semantic-release builds `.ipk` + `.apk` and publishes a GitHub Release on every conventional commit.            |
 
@@ -38,10 +38,10 @@
 
 | Layer        | Technology                                                                        |
 | ------------ | --------------------------------------------------------------------------------- |
-| **Runtime**  | OpenWrt (LuCI)                                                                    |
-| **Backend**  | C (`bitsxl`) + `rpcd` ACL + `uci`                                                 |
+| **Runtime**  | OpenWrt (LuCI + UCI)                                                              |
+| **Backend**  | Python 3 (`bitsxl`) + `rpcd` ACL + `uci`                                          |
 | **Frontend** | JavaScript (LuCI AMD views loaded via `require`)                                  |
-| **Build**    | `bash` + `tar` (ipk) + `apk-tools v3` (apk) — no SDK                            |
+| **Build**    | `bash` + `tar` (ipk) + `apk-tools v3` (apk) — no SDK                             |
 | **Release**  | semantic-release + GitHub Actions                                                 |
 
 ---
@@ -52,30 +52,26 @@
 BITS-XL/
 ├── .github/
 │   ├── dependabot.yml             # dep update (npm + actions)
-    │   └── workflows/
-    │       └── release.yml            # semantic-release + build .ipk/.apk + attach asset
-    ├── luci-app-bitsxl/
-    │   ├── htdocs/
-    │   │   └── luci-static/resources/view/bitsxl/
-    │   │       ├── dashboard-segments.js
-    │   │       ├── store.js
-    │   │       ├── riwayat-logs.js
-    │   │       ├── notifikasi.js
-    │   │       └── settings.js
-    │   └── root/
-    │       ├── etc/config/bitsxl
-    │       └── usr/share/
-    │           ├── luci/menu.d/luci-app-bitsxl.json
-    │           └── rpcd/acl.d/luci-app-bitsxl.json
-    ├── scripts/
-    │   └── prepare.js                # sync version + build .ipk/.apk (semantic-release)
-├── build.sh                      # SDK-less .ipk + .apk packer (bash + tar + apk-tools)
-├── control                       # ipk metadata
-├── postinst                      # reload ACL/menu
-├── conffiles                     # jangan timpa /etc/config/bitsxl saat upgrade
-├── package.json                  # semantic-release + plugins
-├── package-lock.json             # npm lockfile (npm ci)
-├── .releaserc.json               # release plugins (git + github)
+│   └── workflows/
+│       └── release.yml            # semantic-release + build .ipk/.apk + attach asset
+├── bitsxl/                        # ← paket BACKEND (Python)
+│   ├── control                    # ipk/apk metadata (+ Depends)
+│   ├── conffiles                  # preserve /etc/config/bitsxl
+│   ├── postinst                   # clear cache + best-effort pip install pycryptodome
+│   └── root/
+│       ├── usr/bin/bitsxl         # backend CLI (Python 3)
+│       └── etc/config/bitsxl      # UCI default config (credentials)
+├── luci-app-bitsxl/               # ← paket UI, Depends: bitsxl
+│   ├── control                    # ipk/apk metadata
+│   ├── postinst                   # clear LuCI cache
+│   ├── htdocs/luci-static/resources/view/bitsxl/*.js   # LuCI AMD views
+│   └── root/usr/share/{luci,rpcd}/...                  # menu + ACL
+├── scripts/
+│   └── prepare.js                 # sync version + build .ipk/.apk
+├── build.sh                       # SDK-less .ipk + .apk packer (2 packages)
+├── package.json                   # semantic-release + plugins
+├── package-lock.json              # npm lockfile (npm ci)
+├── .releaserc.json                # release plugins (git + github)
 └── LICENSE
 ```
 
@@ -85,8 +81,8 @@ BITS-XL/
 
 ### Prerequisites
 
-- An OpenWrt device (22.03+), with the `luci` feed installed
-- The `bitsxl` binary (shipped via the BITS feed / `BITS-WRT-Packages`)
+- An OpenWrt device (22.03+), with `python3` + internet access for the XL API.
+- `pycryptodome` (installed best-effort via `pip` in the backend `postinst`).
 
 ### 1. Download
 
@@ -97,14 +93,15 @@ Grab package dari [Releases](https://github.com/Banten-IT-Solutions/BITS-XL/rele
 ### 2. Install
 
 ```sh
-# OpenWrt 22.03–24.10 (opkg)
+# backend (wajib)
+opkg install bitsxl_<version>_all.ipk          # 22.03–24.10
+# halaman LuCI (opsional, Depends: bitsxl)
 opkg install luci-app-bitsxl_<version>_all.ipk
 
 # OpenWrt 25.12+ (apk)
+apk add bitsxl_<version>_all.apk
 apk add luci-app-bitsxl_<version>_all.apk
 ```
-
-`bitsxl` (binary) is installed automatically via the package dependency.
 
 ### 3. Use
 
@@ -132,13 +129,12 @@ SDK-less `.ipk` + `.apk`. Butuh `apk-tools v3` (`apk mkpkg`) di `PATH`. Di CI su
 
 ```sh
 ./build.sh
-# output: dist/luci-app-bitsxl_<version>_all.ipk
-#         dist/luci-app-bitsxl_<version>_all.apk
+# output: dist/bitsxl_<version>_all.ipk
+#         dist/luci-app-bitsxl_<version>_all.ipk
+#         dist/*.apk (bila apk-tools tersedia)
 ```
 
 > `.ipk` = outer `tar.gz` (debian-binary + control.tar.gz + data.tar.gz). `.apk` = ADB container via `apk mkpkg`.
->
-> The `bitsxl` native backend binary is shipped separately via the BITS feed (`BITS-WRT-Packages`).
 
 ---
 

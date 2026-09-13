@@ -1,0 +1,3505 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# bitsxl — Python port of the BITS XL (myXL) backend, byte-exact crypto against the C original.
+import sys
+import os
+import time
+import json
+import hashlib
+import hmac
+import base64
+import random as _random
+import re
+
+try:
+    from Crypto.Cipher import AES
+except ImportError as _e:  # pragma: no cover
+    AES = None
+
+VERSION = "1.2.0-r1"
+DECOY_V2_PAYMENT_FOR = "\U0001F92B"      # \xF0\x9F\xA4\xAB  (shushing face)
+FAMILY_LOOP_PAYMENT_FOR = "\U0001F911"  # \xF0\x9F\xA4\x91  (money-mouth face)
+
+TOKEN_CACHE_TTL = 240
+HTTP_RESPONSE_MAX = 2 * 1024 * 1024
+RESPONSE_CACHE_MAX = 1024 * 1024
+RESPONSE_CACHE_DIR = "/tmp/bitsxl-cache"
+DASHBOARD_TTL = 15
+TIERING_TTL = 30
+STORE_TTL = 300
+
+DEFAULTS = {
+    "BASE_API_URL": "https://api.myxl.xlaxiata.co.id",
+    "BASE_CIAM_URL": "https://gede.ciam.xlaxiata.co.id",
+    "BASIC_AUTH": "OWZjOTdlZDEtNmEzMC00OGQ1LTk1MTYtNjBjNTNjZTNhMTM1OllEV21GNExKajlYSUt3UW56eTJlMmxiMHRKUWIyOW8z",
+    "AX_FP_KEY": "18b4d589826af50241177961590e6693",
+    "UA": "myXL / 8.9.0(1202); com.android.vending; (samsung; SM-N935F; SDK 33; Android 13)",
+    "API_KEY": "vT8tINqHaOxXbGE7eOWAhA==",
+    "ENCRYPTED_FIELD_KEY": "5dccbf08920a5527",
+    "XDATA_KEY": "5dccbf08920a5527b99e222789c34bb7",
+    "AX_API_SIG_KEY": "18b4d589826af50241177961590e6693",
+    "X_API_BASE_SECRET": "mU1Y4n1vBjf3M7tMnRkFU08mVyUJHed8B5En3EAniu1mXLixeuASmBmKnkyzVziOye7rG5nIekMdthensbQMcOJ6SLnrkGyfXALD7mrBC6vuWv6G01pmD3XlU5rT7Tzx",
+    "DECOY_PREPAID_FAMILY_CODE": "",
+    "DECOY_PREPAID_PACKAGE_NUMBER": "",
+    "DECOY_PRIORITAS_FAMILY_CODE": "",
+    "DECOY_PRIORITAS_PACKAGE_NUMBER": "",
+    "DECOY_PRIOHYBRID_FAMILY_CODE": "",
+    "DECOY_PRIOHYBRID_PACKAGE_NUMBER": "",
+}
+
+CFG = dict(DEFAULTS)
+CFG["home"] = "/root/.bitsxl"
+CFG["env_path"] = ""
+
+json_payment_confirmed = False
+
+
+def die(msg, code=1):
+    sys.stderr.write(msg + "\n")
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------------------
+# crypto (byte-exact)
+# ---------------------------------------------------------------------------
+def sha256(m):
+    return hashlib.sha256(m).digest()
+
+
+def sha512(m):
+    return hashlib.sha512(m).digest()
+
+
+def md5(m):
+    return hashlib.md5(m).digest()
+
+
+def hmac_hash(sha512_mode, key, msg):
+    return hmac.new(key, msg, hashlib.sha512 if sha512_mode else hashlib.sha256).digest()
+
+
+def b64_encode(data, urlsafe=False):
+    if urlsafe:
+        return base64.urlsafe_b64encode(data).decode()
+    return base64.b64encode(data).decode()
+
+
+def b64_decode(s):
+    # lenient: accept both standard (`+/`) and urlsafe (`-_`) alphabets (C b64_val maps both).
+    try:
+        return base64.b64decode(s, altchars=b"-_", validate=False)
+    except Exception:
+        return b""
+
+
+def hex_encode(b):
+    return b.hex()
+
+
+def pkcs7_pad(data):
+    pad = 16 - (len(data) % 16)
+    return data + bytes([pad]) * pad
+
+
+def pkcs7_unpad(buf):
+    if not buf:
+        return None
+    pad = buf[-1]
+    if pad < 1 or pad > 16 or pad > len(buf):
+        return None
+    if buf[-pad:] != bytes([pad]) * pad:
+        return None
+    return buf[:-pad]
+
+
+def aes_cbc(enc, key, iv, data):
+    if AES is None:
+        die("aes pycryptodome missing")
+    key = key.encode() if isinstance(key, str) else key
+    iv = iv.encode() if isinstance(iv, str) else iv
+    data = data.encode() if isinstance(data, str) else data
+    c = AES.new(key, AES.MODE_CBC, iv)
+    return c.encrypt(data) if enc else c.decrypt(data)
+
+
+def encrypt_xdata(plain, xtime):
+    xt = str(xtime)
+    digest = sha256(xt.encode())
+    hx = digest.hex()
+    iv = hx.encode()[:16]
+    padded = pkcs7_pad(plain.encode() if isinstance(plain, str) else plain)
+    ct = aes_cbc(True, CFG["XDATA_KEY"], iv, padded)
+    return b64_encode(ct, urlsafe=True)
+
+
+def decrypt_xdata_payload(j):
+    o = parse_json(j)
+    if not isinstance(o, dict):
+        return None
+    xdata = o.get("xdata")
+    xtime = o.get("xtime")
+    if not isinstance(xdata, str) or not isinstance(xtime, int):
+        return None
+    xt = str(xtime)
+    digest = sha256(xt.encode())
+    hx = digest.hex()
+    iv = hx.encode()[:16]
+    ct = b64_decode(xdata)
+    if len(ct) % 16:
+        return None
+    pt = aes_cbc(False, CFG["XDATA_KEY"], iv, ct)
+    pt = pkcs7_unpad(pt)
+    if pt is None:
+        return None
+    return pt.decode("utf-8", "replace")
+
+
+def make_x_signature(id_token, method, path, sig_time):
+    key = f"{CFG['X_API_BASE_SECRET']};{id_token};{method};{path};{sig_time}"
+    msg = f"{id_token};{sig_time};"
+    return hmac_hash(True, key.encode(), msg.encode()).hex()
+
+
+def make_x_signature_payment(access_token, payment_ts, package_code, token_payment, payment_method, payment_for, path):
+    key = f"{CFG['X_API_BASE_SECRET']};{payment_ts}#ae-hei_9Tee6he+Ik3Gais5=;POST;{path};{payment_ts}"
+    msg = f"{access_token};{token_payment};{payment_ts};{payment_for};{payment_method};{package_code};"
+    return hmac_hash(True, key.encode(), msg.encode()).hex()
+
+
+def make_x_signature_bounty(access_token, sig_time, package_code, token):
+    path = "api/v8/personalization/bounties-exchange"
+    key = f"{CFG['X_API_BASE_SECRET']};{access_token};{sig_time}#ae-hei_9Tee6he+Ik3Gais5=;POST;{path};{sig_time}"
+    msg = f"{access_token};{token};{sig_time};{package_code};"
+    return hmac_hash(True, key.encode(), msg.encode()).hex()
+
+
+def make_x_signature_loyalty(sig_time, package_code, token, path):
+    key = f"{CFG['X_API_BASE_SECRET']};{sig_time}#ae-hei_9Tee6he+Ik3Gais5=;POST;{path};{sig_time}"
+    msg = f"{token};{sig_time};{package_code};"
+    return hmac_hash(True, key.encode(), msg.encode()).hex()
+
+
+def make_x_signature_bounty_allotment(sig_time, package_code, token, path, dest):
+    key = f"{CFG['X_API_BASE_SECRET']};{sig_time}#ae-hei_9Tee6he+Ik3Gais5=;{dest};POST;{path};{sig_time}"
+    msg = f"{token};{sig_time};{dest};{package_code};"
+    return hmac_hash(True, key.encode(), msg.encode()).hex()
+
+
+def encrypted_empty_field():
+    if not CFG["ENCRYPTED_FIELD_KEY"]:
+        return ""
+    rb = os.urandom(8)
+    iv_hex = rb.hex()
+    iv = iv_hex.encode()
+    pt = bytes([16]) * 16
+    ct = aes_cbc(True, CFG["ENCRYPTED_FIELD_KEY"], iv, pt)
+    return b64_encode(ct, urlsafe=True) + iv_hex
+
+
+def make_ax_api_signature(ts, contact, code, contact_type):
+    pre = f"{ts}password{contact_type}{contact}{code}openid"
+    mac = hmac_hash(False, CFG["AX_API_SIG_KEY"].encode(), pre.encode())
+    return b64_encode(mac, urlsafe=False)
+
+
+def ax_fingerprint():
+    path = os.path.join(CFG["home"], "ax.fp")
+    try:
+        with open(path, "r") as f:
+            existing = f.read().strip()
+        if existing:
+            return existing
+    except Exception:
+        pass
+    r1 = 1000 + (int.from_bytes(os.urandom(2), "big") % 9000)
+    r2 = 1000 + (int.from_bytes(os.urandom(2), "big") % 9000)
+    plain = f"samsung{r1}|SM-N93{r2}|en|720x1540|GMT07:00|192.169.69.69|1.0|Android 13|6281398370564"
+    iv = b"\x00" * 16
+    padded = pkcs7_pad(plain.encode())
+    ct = aes_cbc(True, CFG["AX_FP_KEY"], iv, padded)
+    b64 = b64_encode(ct, urlsafe=False)
+    try:
+        os.makedirs(CFG["home"], mode=0o700, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(b64)
+    except Exception:
+        pass
+    return b64
+
+
+def ax_device_id(fp):
+    return md5(fp.encode()).hex()
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def uuid_v4():
+    b = bytearray(os.urandom(16))
+    b[6] = (b[6] & 0x0F) | 0x40
+    b[8] = (b[8] & 0x3F) | 0x80
+    h = b.hex()
+    return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+
+
+def timestamp_java_local():
+    ms = now_ms()
+    t = time.localtime(ms // 1000)
+    zraw = time.strftime("%z", t) or "+0000"
+    z = zraw[:3] + ":" + zraw[3:] if len(zraw) == 5 else zraw
+    base = time.strftime("%Y-%m-%dT%H:%M:%S", t)
+    return f"{base}.{(ms % 1000) // 10:02d}{z}"
+
+
+def timestamp_gmt7(minus_seconds):
+    ms = now_ms() - minus_seconds * 1000
+    t = time.gmtime(ms // 1000 + 7 * 3600)
+    base = time.strftime("%Y-%m-%dT%H:%M:%S", t)
+    return f"{base}.{ms % 1000:03d}+0700"
+
+
+def timestamp_gmt7_colon():
+    ms = now_ms()
+    t = time.gmtime(ms // 1000 + 7 * 3600)
+    base = time.strftime("%Y-%m-%dT%H:%M:%S", t)
+    return f"{base}.{(ms % 1000) // 10:02d}+07:00"
+
+
+# ---------------------------------------------------------------------------
+# json / string helpers
+# ---------------------------------------------------------------------------
+def parse_json(s):
+    if s is None:
+        return None
+    if isinstance(s, (dict, list)):
+        return s
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+
+def jstr(s):
+    return json.dumps("" if s is None else s, ensure_ascii=False)
+
+
+def jval(s):
+    """Embed an API response: parsed object if valid JSON, else the raw string."""
+    o = parse_json(s)
+    if o is not None:
+        return o
+    return "" if s is None else s
+
+
+def jget_s(obj, key):
+    if isinstance(obj, dict):
+        v = obj.get(key)
+        return v if isinstance(v, str) else None
+    return None
+
+
+def jget_ll(obj, key, defv=-1):
+    if isinstance(obj, dict):
+        v = obj.get(key)
+        if isinstance(v, int) and not isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            try:
+                return int(v)
+            except ValueError:
+                return defv
+    return defv
+
+
+def jget_llany(obj, key, defv=-1):
+    return jget_ll(obj, key, defv)
+
+
+def jdup(obj, key):
+    if isinstance(obj, dict):
+        v = obj.get(key)
+        return v if isinstance(v, (dict, list)) else None
+    return None
+
+
+def trim(s):
+    return s.strip()
+
+
+def url_encode(s):
+    from urllib.parse import quote
+    return quote(s, safe="~-_.!*'()")
+
+
+def is_true(s):
+    return s in ("1", "y", "Y", "true", "TRUE", "yes", "YES")
+
+
+def money_id(v):
+    s = str(v)
+    n = len(s)
+    out = []
+    for i, ch in enumerate(reversed(s)):
+        if i and i % 3 == 0:
+            out.append(".")
+        out.append(ch)
+    return "".join(reversed(out))
+
+
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+def load_env_file(path):
+    try:
+        with open(path, "r") as f:
+            lines = f.read().splitlines()
+    except Exception:
+        return -1
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+            v = v[1:-1]
+        if k in CFG:
+            CFG[k] = v
+    return 0
+
+
+CONFIG_REQUIRED = ["BASE_API_URL", "BASE_CIAM_URL", "BASIC_AUTH", "AX_FP_KEY", "UA", "API_KEY", "XDATA_KEY", "AX_API_SIG_KEY", "X_API_BASE_SECRET"]
+
+
+def config_missing():
+    for k in CONFIG_REQUIRED:
+        if not CFG.get(k):
+            return k
+    return None
+
+
+def ensure_dir(path):
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+    except Exception:
+        pass
+
+
+def load_uci_config():
+    # UCI is the source of truth on OpenWrt (LuCI Settings wins over env file).
+    import subprocess
+    try:
+        out = subprocess.run(["uci", "show", "bitsxl"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return
+    for line in out.splitlines():
+        i = line.find(".config.")
+        if i < 0:
+            continue
+        rest = line[i + len(".config."):]
+        if "=" not in rest:
+            continue
+        k, v = rest.split("=", 1)
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] == "'":
+            v = v[1:-1]
+        if k in CFG:
+            CFG[k] = v
+
+
+def load_config():
+    home = os.environ.get("BITSXL_HOME")
+    if not home:
+        uh = os.environ.get("HOME")
+        home = f"{uh}/.bitsxl" if uh else "/root/.bitsxl"
+    CFG["home"] = home
+    env = os.environ.get("BITSXL_ENV")
+    loaded = False
+    if env:
+        if load_env_file(env) == 0:
+            CFG["env_path"] = env
+            loaded = True
+    if not loaded:
+        for p in ("/etc/bitsxl/.env", "/etc/bitsxl.env", ".env"):
+            if load_env_file(p) == 0:
+                CFG["env_path"] = p
+                loaded = True
+                break
+    load_uci_config()
+    ensure_dir(CFG["home"])
+
+
+def require_config():
+    m = config_missing()
+    if m:
+        die(f"missing env {m} in /etc/bitsxl/.env or /etc/bitsxl.env")
+
+
+# ---------------------------------------------------------------------------
+# http
+# ---------------------------------------------------------------------------
+def http_fetch(url, method, headers, body=None):
+    import urllib.request
+    import urllib.error
+    import ssl
+
+    if not url:
+        return '{"status":"FAILED","code":"HTTP_FETCH_FAILED","exit":3,"curl":3}'
+    hdrs = {}
+    for h in headers or []:
+        h = h[9:] if h.startswith("--header=") else h
+        if ":" in h:
+            k, val = h.split(":", 1)
+            hdrs[k.strip()] = val.strip()
+    data = body.encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method="POST" if body is not None else "GET")
+    for k, val in hdrs.items():
+        req.add_header(k, val)
+    ctx = ssl.create_default_context()
+    resp_body = b""
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
+            while True:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                resp_body += chunk
+                if len(resp_body) > HTTP_RESPONSE_MAX:
+                    return f'{{"status":"FAILED","code":"HTTP_RESPONSE_TOO_LARGE","limit":{HTTP_RESPONSE_MAX}}}'
+    except urllib.error.HTTPError as e:
+        resp_body = e.read() if e.fp else b""
+    except urllib.error.URLError as e:
+        # keep the body we may have; return failure JSON
+        pass
+    except Exception as e:
+        return '{"status":"FAILED","code":"HTTP_FETCH_FAILED","exit":1,"curl":1}'
+    if not resp_body:
+        # could be a successful empty response
+        return resp_body.decode("utf-8", "replace")
+    return resp_body.decode("utf-8", "replace")
+
+
+def http_fetch_failed(code):
+    return f'{{"status":"FAILED","code":"HTTP_FETCH_FAILED","exit":{code},"curl":{code}}}'
+
+
+def host_from_url(url):
+    p = url.find("://")
+    h = url[p + 3:] if p >= 0 else url
+    slash = h.find("/")
+    return h[:slash] if slash >= 0 else h
+
+
+# ---------------------------------------------------------------------------
+# api requests
+# ---------------------------------------------------------------------------
+def ciam_headers(content_type, bearer_token, ax_sig, ax_req_at):
+    fp = ax_fingerprint()
+    dev = ax_device_id(fp)
+    host = host_from_url(CFG["BASE_CIAM_URL"])
+    u = uuid_v4()
+    at = ax_req_at if ax_req_at else timestamp_gmt7_colon()
+    auth = f"Bearer {bearer_token}" if bearer_token else f"Basic {CFG['BASIC_AUTH']}"
+    h = ["Accept-Encoding: identity", f"Authorization: {auth}"]
+    if ax_sig:
+        h.append(f"Ax-Api-Signature: {ax_sig}")
+    h += [
+        f"Ax-Device-Id: {dev}",
+        f"Ax-Fingerprint: {fp}",
+        f"Ax-Request-At: {at}",
+        "Ax-Request-Device: samsung",
+        "Ax-Request-Device-Model: SM-N935F",
+        f"Ax-Request-Id: {u}",
+        "Ax-Substype: PREPAID",
+        f"Content-Type: {content_type}",
+        f"Host: {host}",
+        f"User-Agent: {CFG['UA']}",
+    ]
+    return h
+
+
+def api_request(path, payload, id_token):
+    if not id_token:
+        return '{"status":"FAILED","code":"REQUEST_MISSING_BEARER","message":"missing id_token"}'
+    xtime = now_ms()
+    sig_time = xtime // 1000
+    xdata = encrypt_xdata(payload, xtime)
+    body = json.dumps({"xdata": xdata, "xtime": xtime})
+    sig = make_x_signature(id_token, "POST", path, sig_time)
+    host = host_from_url(CFG["BASE_API_URL"])
+    url = f"{CFG['BASE_API_URL']}/{path}"
+    h = [
+        f"host: {host}",
+        "content-type: application/json; charset=utf-8",
+        f"user-agent: {CFG['UA']}",
+        f"x-api-key: {CFG['API_KEY']}",
+        f"Authorization: Bearer {id_token}",
+        "x-hv: v3",
+        f"x-signature-time: {sig_time}",
+        f"x-signature: {sig}",
+        f"x-request-id: {uuid_v4()}",
+        f"x-request-at: {timestamp_java_local()}",
+        "x-version-app: 8.9.0",
+    ]
+    resp = http_fetch(url, "POST", h, body)
+    plain = decrypt_xdata_payload(resp)
+    return plain if plain is not None else resp
+
+
+def api_request_payment(path, payload, t, payment_targets, token_payment, payment_for, payment_ts):
+    if not t.get("id_token") or not t.get("access_token"):
+        return '{"status":"FAILED","code":"REQUEST_MISSING_BEARER","message":"missing token"}'
+    return _api_request_payment_impl(path, payload, t, payment_targets, token_payment, "BALANCE", payment_for, payment_ts)
+
+
+def api_request_payment_method(path, payload, t, payment_targets, token_payment, payment_method, payment_for, payment_ts):
+    if not t.get("id_token") or not t.get("access_token"):
+        return '{"status":"FAILED","code":"REQUEST_MISSING_BEARER","message":"missing token"}'
+    return _api_request_payment_impl(path, payload, t, payment_targets, token_payment, payment_method, payment_for, payment_ts)
+
+
+def _api_request_payment_impl(path, payload, t, payment_targets, token_payment, payment_method, payment_for, payment_ts):
+    xtime = now_ms()
+    sig_time = xtime // 1000
+    xdata = encrypt_xdata(payload, xtime)
+    body = json.dumps({"xdata": xdata, "xtime": xtime})
+    sig = make_x_signature_payment(t["access_token"], payment_ts, payment_targets, token_payment, payment_method, payment_for, path)
+    host = host_from_url(CFG["BASE_API_URL"])
+    url = f"{CFG['BASE_API_URL']}/{path}"
+    h = [
+        f"host: {host}",
+        "content-type: application/json; charset=utf-8",
+        f"user-agent: {CFG['UA']}",
+        f"x-api-key: {CFG['API_KEY']}",
+        f"Authorization: Bearer {t['id_token']}",
+        "x-hv: v3",
+        f"x-signature-time: {sig_time}",
+        f"x-signature: {sig}",
+        f"x-request-id: {uuid_v4()}",
+        f"x-request-at: {timestamp_java_local()}",
+        "x-version-app: 8.9.0",
+    ]
+    resp = http_fetch(url, "POST", h, body)
+    plain = decrypt_xdata_payload(resp)
+    return plain if plain is not None else resp
+
+
+def api_request_custom_sig(path, payload, t, sig):
+    if not t.get("id_token"):
+        return '{"status":"FAILED","code":"REQUEST_MISSING_BEARER","message":"missing id_token"}'
+    xtime = now_ms()
+    sig_time = xtime // 1000
+    xdata = encrypt_xdata(payload, xtime)
+    body = json.dumps({"xdata": xdata, "xtime": xtime})
+    host = host_from_url(CFG["BASE_API_URL"])
+    url = f"{CFG['BASE_API_URL']}/{path}"
+    h = [
+        f"host: {host}",
+        "content-type: application/json; charset=utf-8",
+        f"user-agent: {CFG['UA']}",
+        f"x-api-key: {CFG['API_KEY']}",
+        f"Authorization: Bearer {t['id_token']}",
+        "x-hv: v3",
+        f"x-signature-time: {sig_time}",
+        f"x-signature: {sig}",
+        f"x-request-id: {uuid_v4()}",
+        f"x-request-at: {timestamp_java_local()}",
+        "x-version-app: 8.9.0",
+    ]
+    resp = http_fetch(url, "POST", h, body)
+    plain = decrypt_xdata_payload(resp)
+    return plain if plain is not None else resp
+
+
+def request_otp(number):
+    num = url_encode(number)
+    url = f"{CFG['BASE_CIAM_URL']}/realms/xl-ciam/auth/otp?contact={num}&contactType=SMS&alternateContact=false"
+    h = ciam_headers("application/json", None, None, None)
+    return http_fetch(url, "GET", h)
+
+
+def submit_otp(contact_type, contact, code):
+    ts_sign = timestamp_gmt7(0)
+    ts_head = timestamp_gmt7(300)
+    final_contact = b64_encode(contact.encode(), urlsafe=False) if contact_type == "DEVICEID" else contact
+    sig = make_ax_api_signature(ts_sign, final_contact, code, contact_type)
+    body = f"contactType={url_encode(contact_type)}&code={url_encode(code)}&grant_type=password&contact={url_encode(final_contact)}&scope=openid"
+    url = f"{CFG['BASE_CIAM_URL']}/realms/xl-ciam/protocol/openid-connect/token"
+    h = ciam_headers("application/x-www-form-urlencoded", None, sig, ts_head)
+    return http_fetch(url, "POST", h, body)
+
+
+def extend_session(subscriber_id):
+    b = b64_encode(subscriber_id.encode(), urlsafe=False)
+    url = f"{CFG['BASE_CIAM_URL']}/realms/xl-ciam/auth/extend-session?contact={url_encode(b)}&contactType=DEVICEID"
+    h = ciam_headers("application/json", None, None, None)
+    return http_fetch(url, "GET", h)
+
+
+def refresh_token_http(refresh_token):
+    body = f"grant_type=refresh_token&refresh_token={url_encode(refresh_token)}"
+    url = f"{CFG['BASE_CIAM_URL']}/realms/xl-ciam/protocol/openid-connect/token"
+    h = ciam_headers("application/x-www-form-urlencoded", None, None, None)
+    return http_fetch(url, "POST", h, body)
+
+
+# ---------------------------------------------------------------------------
+# accounts / tokens
+# ---------------------------------------------------------------------------
+def accounts_path():
+    return os.path.join(CFG["home"], "accounts.tsv")
+
+
+def active_path():
+    return os.path.join(CFG["home"], "active")
+
+
+def accounts_load():
+    a = []
+    try:
+        with open(accounts_path(), "r") as f:
+            for line in f.read().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 4:
+                    continue
+                a.append({"number": parts[0], "subscriber_id": parts[1], "subscription_type": parts[2], "refresh_token": parts[3], "dirty": False, "is_new": False})
+    except Exception:
+        pass
+    return a
+
+
+def accounts_save(a):
+    # ponytail: best-effort write, no flock (single-process invocation model). Add fcntl.flock if concurrent use shows races.
+    try:
+        os.makedirs(CFG["home"], mode=0o700, exist_ok=True)
+        tmp = accounts_path() + f".{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            for it in a:
+                f.write(f"{it['number']}\t{it['subscriber_id']}\t{it['subscription_type']}\t{it['refresh_token']}\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, accounts_path())
+    except Exception:
+        pass
+
+
+def accounts_find(a, number):
+    for it in a:
+        if it["number"] == number:
+            return it
+    return None
+
+
+def accounts_put(a, number, sub, typ, rt):
+    e = accounts_find(a, number)
+    if not e:
+        e = {"number": number, "subscriber_id": "", "subscription_type": "", "refresh_token": "", "dirty": True, "is_new": True}
+        a.append(e)
+    changed = False
+    if sub and e["subscriber_id"] != sub:
+        e["subscriber_id"] = sub
+        changed = True
+    if typ and e["subscription_type"] != typ:
+        e["subscription_type"] = typ
+        changed = True
+    if rt and e["refresh_token"] != rt:
+        e["refresh_token"] = rt
+        changed = True
+    if changed:
+        e["dirty"] = True
+
+
+def active_get():
+    try:
+        with open(active_path(), "r") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def active_set(number):
+    try:
+        os.makedirs(CFG["home"], mode=0o700, exist_ok=True)
+        with open(active_path(), "w") as f:
+            f.write(number)
+    except Exception:
+        pass
+
+
+def safe_name(number):
+    return "".join(c if c.isalnum() or c in "_-" else "_" for c in (number or "active")) or "active"
+
+
+def token_cache_path(a):
+    n = a["number"] if a and a.get("number") else "active"
+    return os.path.join(CFG["home"], f"token-{safe_name(n)}.json")
+
+
+def token_cache_load(a, t):
+    try:
+        with open(token_cache_path(a), "r") as f:
+            o = json.load(f)
+    except Exception:
+        return -1
+    if not isinstance(o, dict):
+        return -1
+    exp = o.get("expires_at", 0)
+    if not isinstance(exp, int) or exp <= int(time.time()):
+        return -1
+    at = o.get("access_token")
+    it = o.get("id_token")
+    rt = o.get("refresh_token")
+    if not rt and a and a.get("refresh_token"):
+        rt = a["refresh_token"]
+    if not at or not it or not rt:
+        return -1
+    t["access_token"] = at
+    t["id_token"] = it
+    t["refresh_token"] = rt
+    t["cached"] = True
+    return 0
+
+
+def token_cache_save(a, t):
+    if not a or not t.get("access_token") or not t.get("id_token") or not t.get("refresh_token"):
+        return
+    data = json.dumps({
+        "expires_at": int(time.time()) + TOKEN_CACHE_TTL,
+        "access_token": t["access_token"],
+        "id_token": t["id_token"],
+        "refresh_token": t["refresh_token"],
+    })
+    try:
+        os.makedirs(CFG["home"], mode=0o700, exist_ok=True)
+        with open(token_cache_path(a), "w") as f:
+            f.write(data)
+    except Exception:
+        pass
+
+
+def token_cache_delete(a):
+    try:
+        os.unlink(token_cache_path(a))
+    except Exception:
+        pass
+
+
+def parse_tokens(j, t):
+    o = parse_json(j)
+    if not isinstance(o, dict):
+        return -1
+    at = o.get("access_token")
+    it = o.get("id_token")
+    rt = o.get("refresh_token")
+    if not at or not it or not rt:
+        return -1
+    t["access_token"] = at
+    t["id_token"] = it
+    t["refresh_token"] = rt
+    return 0
+
+
+def refresh_account(a, t):
+    if not a.get("refresh_token"):
+        sys.stderr.write("refresh token missing\n")
+        return -1
+    if token_cache_load(a, t) == 0:
+        return 0
+    resp = refresh_token_http(a["refresh_token"])
+    if "Session not active" in resp:
+        if not a.get("subscriber_id"):
+            sys.stderr.write("session inactive and subscriber_id missing\n")
+            token_cache_delete(a)
+            return -1
+        ex = extend_session(a["subscriber_id"])
+        code = jget_s(parse_json(ex), "exchange_code")
+        if not code:
+            sys.stderr.write(f"extend-session failed: {ex}\n")
+            token_cache_delete(a)
+            return -1
+        resp = submit_otp("DEVICEID", a["subscriber_id"], code)
+    if parse_tokens(resp, t):
+        sys.stderr.write(f"refresh failed: {resp}\n")
+        token_cache_delete(a)
+        return -1
+    token_cache_save(a, t)
+    return 0
+
+
+def get_profile(t):
+    payload = json.dumps({"access_token": t["access_token"], "app_version": "8.9.0", "is_enterprise": False, "lang": "en"})
+    return api_request("api/v8/profile", payload, t["id_token"])
+
+
+def account_update_profile(a, t):
+    changed = False
+    if t.get("refresh_token") and a["refresh_token"] != t["refresh_token"]:
+        a["refresh_token"] = t["refresh_token"]
+        changed = True
+    if not (t.get("cached") and a.get("subscriber_id") and a.get("subscription_type")):
+        profile = get_profile(t)
+        po = parse_json(profile)
+        sub = jget_s(po, "subscriber_id")
+        typ = jget_s(po, "subscription_type")
+        if typ and a["subscription_type"] != typ:
+            a["subscription_type"] = typ
+            changed = True
+        if sub and a["subscriber_id"] != sub:
+            a["subscriber_id"] = sub
+            changed = True
+    if changed:
+        a["dirty"] = True
+    return changed
+
+
+def account_sync(accounts, account, t):
+    if account_update_profile(account, t):
+        accounts_save(accounts)
+
+
+# ---------------------------------------------------------------------------
+# api get_* functions
+# ---------------------------------------------------------------------------
+def get_quota(t):
+    return api_request("api/v8/packages/quota-details", '{"is_enterprise":false,"lang":"en","family_member_id":""}', t["id_token"])
+
+
+def get_balance_api(t):
+    return api_request("api/v8/packages/balance-and-credit", '{"is_enterprise":false,"lang":"en"}', t["id_token"])
+
+
+def get_tiering_info_api(t):
+    return api_request("gamification/api/v8/loyalties/tiering/info", '{"is_enterprise":false,"lang":"en"}', t["id_token"])
+
+
+def get_transaction_history_api(t):
+    return api_request("payments/api/v8/transaction-history", '{"is_enterprise":false,"lang":"en"}', t["id_token"])
+
+
+def get_pending_transactions_api(t):
+    return get_profile(t)
+
+
+def get_notifications_api(t):
+    payload = json.dumps({"access_token": t["access_token"]})
+    return api_request("dashboard/api/v8/segments", payload, t["id_token"])
+
+
+def get_notification_detail_api(t, notification_id):
+    payload = json.dumps({"is_enterprise": False, "lang": "en", "notification_id": notification_id})
+    return api_request("api/v8/notification/detail", payload, t["id_token"])
+
+
+def get_transaction_status_api(t, tx, status_arg):
+    payload = json.dumps({"transaction_id": tx, "is_enterprise": False, "lang": "en", "status": status_arg or ""})
+    return api_request("payments/api/v8/pending-detail", payload, t["id_token"])
+
+
+def get_redeemables_api(t, ent):
+    payload = json.dumps({"is_enterprise": ent, "lang": "en"})
+    return api_request("api/v8/personalization/redeemables", payload, t["id_token"])
+
+
+def get_store_segments(t, ent):
+    payload = json.dumps({"is_enterprise": ent, "lang": "en"})
+    return api_request("api/v8/configs/store/segments", payload, t["id_token"])
+
+
+def get_store_packages(t, subs_type, ent):
+    st = subs_type or "PREPAID"
+    payload = json.dumps({
+        "is_enterprise": ent,
+        "filters": [
+            {"unit": "THOUSAND", "id": "FIL_SEL_P", "type": "PRICE", "items": []},
+            {"unit": "GB", "id": "FIL_SEL_MQ", "type": "DATA_TYPE", "items": []},
+            {"unit": "PACKAGE_NAME", "id": "FIL_PKG_N", "type": "PACKAGE_NAME", "items": [{"id": "", "label": ""}]},
+            {"unit": "DAY", "id": "FIL_SEL_V", "type": "VALIDITY", "items": []},
+        ],
+        "substype": st, "text_search": "", "lang": "en",
+    })
+    return api_request("api/v9/xl-stores/options/search", payload, t["id_token"])
+
+
+def get_store_family_list(t, subs_type, ent):
+    st = subs_type or "PREPAID"
+    payload = json.dumps({"is_enterprise": ent, "subs_type": st, "lang": "en"})
+    return api_request("api/v8/xl-stores/options/search/family-list", payload, t["id_token"])
+
+
+def get_store_family_packages_context_result(t, family_code, enterprise_arg, migration_arg, resolved_context=None, result_out=None):
+    migrations = ["NONE", "PRE_TO_PRIOH", "PRIOH_TO_PRIO", "PRIO_TO_PRIOH"]
+    if migration_arg:
+        migrations = [migration_arg]
+    ent_values = [False, True]
+    if enterprise_arg is not None:
+        ent_values = [is_true(enterprise_arg)]
+    if result_out is not None:
+        result_out[0] = -1  # DECOY_RESOLVE_FAILED
+    error_151 = None
+    error_151_context = None
+    last = None
+    for mi in migrations:
+        for ent in ent_values:
+            payload = json.dumps({
+                "is_show_tagging_tab": True, "is_dedicated_event": True, "is_transaction_routine": False,
+                "migration_type": mi, "package_family_code": family_code, "is_autobuy": False,
+                "is_enterprise": ent, "is_pdlp": True, "referral_code": "", "is_migration": False, "lang": "en",
+            })
+            resp = api_request("api/v8/xl-stores/options/list", payload, t["id_token"])
+            o = parse_json(resp)
+            status = jget_s(o, "status")
+            data = jdup(o, "data") if isinstance(o, dict) else None
+            family = jdup(data, "package_family") if isinstance(data, dict) else None
+            name = jget_s(family, "name") if isinstance(family, dict) else None
+            if status == "SUCCESS" and name:
+                # resolved context
+                if resolved_context is not None:
+                    resolved_context.update(resolved_context_set("", family_code, "", ent, mi, 0, 0))
+                if result_out is not None:
+                    result_out[0] = 0
+                return resp
+            if api_auth_failed(resp):
+                if result_out is not None:
+                    result_out[0] = -3  # DECOY_RESOLVE_RETRY_AUTH
+                return resp
+            if error_151 is None and api_error_151(resp):
+                error_151 = resp
+                error_151_context = resolved_context_set("", family_code, "", ent, mi, 0, 0)
+            last = resp
+    if error_151:
+        if resolved_context is not None:
+            resolved_context.update(error_151_context)
+        if result_out is not None:
+            result_out[0] = -2  # DECOY_RESOLVE_RETRY_151
+        return error_151
+    return last if last else '{"status":"FAILED","message":"family not found"}'
+
+
+def resolved_context_set(option_code, family_code, variant_code, is_enterprise, migration_type, package_number, resolved):
+    return {
+        "option_code": option_code or "",
+        "family_code": family_code or "",
+        "variant_code": variant_code or "",
+        "migration_type": migration_type or "NONE",
+        "is_enterprise": bool(is_enterprise),
+        "package_number": package_number,
+        "resolved": bool(resolved),
+    }
+
+
+def get_store_family_packages(t, family_code, ent):
+    return get_store_family_packages_context_result(t, family_code, ent, None)
+
+
+def unsubscribe_quota(t, quota_code, subtype, domain):
+    payload = json.dumps({
+        "product_subscription_type": subtype or "",
+        "quota_code": quota_code,
+        "product_domain": domain or "",
+        "is_enterprise": False, "unsubscribe_reason_code": "", "lang": "en", "family_member_id": "",
+    })
+    return api_request("api/v8/packages/unsubscribe", payload, t["id_token"])
+
+
+def get_package_detail_api_ex(t, option_code, family_code, variant_code, ent, migration_type):
+    fc = family_code if family_code and family_code != "-" else ""
+    vc = variant_code if variant_code and variant_code != "-" else ""
+    mt = migration_type if migration_type else "NONE"
+    payload = json.dumps({
+        "is_transaction_routine": False, "migration_type": mt, "package_family_code": fc, "family_role_hub": "",
+        "is_autobuy": False, "is_enterprise": ent, "is_shareable": False, "is_migration": False, "lang": "en",
+        "package_option_code": option_code, "is_upsell_pdp": False, "package_variant_code": vc,
+    })
+    return api_request("api/v8/xl-stores/options/detail", payload, t["id_token"])
+
+
+def get_package_detail_api(t, option_code):
+    return get_package_detail_api_ex(t, option_code, "", "", False, "NONE")
+
+
+def intercept_page_api(t, option_code):
+    payload = json.dumps({"is_enterprise": False, "lang": "en", "package_option_code": option_code})
+    return api_request("misc/api/v8/utility/intercept-page", payload, t["id_token"])
+
+
+def payment_methods_api(t, q):
+    payload = json.dumps({
+        "payment_type": "PURCHASE", "is_enterprise": q["context"]["is_enterprise"],
+        "payment_target": q["item_code"], "lang": "en", "is_referral": False,
+        "token_confirmation": q["token_confirmation"],
+    })
+    return api_request("payments/api/v8/payment-methods-option", payload, t["id_token"])
+
+
+# ---------------------------------------------------------------------------
+# response cache
+# ---------------------------------------------------------------------------
+def cache_config_tag():
+    # ponytail: FNV-1a in C replaced by sha256 truncation; deterministic + changes on config change. Equivalent observable behavior.
+    concat = "|".join(CFG.get(k, "") or "" for k in DEFAULTS)
+    return hashlib.sha256(concat.encode()).hexdigest()[:16]
+
+
+def cache_path(acc, key):
+    number = acc["number"] if acc and acc.get("number") else "active"
+    return os.path.join(RESPONSE_CACHE_DIR, f"{safe_name(number)}-{cache_config_tag()}-{safe_name(key) or 'data'}.json")
+
+
+def cache_dir_ready():
+    try:
+        os.makedirs(RESPONSE_CACHE_DIR, mode=0o700, exist_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+def response_cache_load(acc, key, ttl):
+    if ttl <= 0 or not cache_dir_ready():
+        return None
+    path = cache_path(acc, key)
+    try:
+        st = os.stat(path)
+        now = time.time()
+        if now - st.st_mtime >= ttl:
+            os.unlink(path)
+            return None
+        with open(path, "r") as f:
+            data = f.read()
+        if not data or len(data) > RESPONSE_CACHE_MAX:
+            os.unlink(path)
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def response_cache_save(acc, key, data):
+    path = cache_path(acc, key)
+    try:
+        os.makedirs(RESPONSE_CACHE_DIR, mode=0o700, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(data)
+    except Exception:
+        pass
+
+
+def response_cache_delete(acc, key):
+    if not cache_dir_ready():
+        return
+    try:
+        os.unlink(cache_path(acc, key))
+    except Exception:
+        pass
+
+
+def response_cache_generation(acc):
+    if not cache_dir_ready():
+        return ""
+    key = "__epoch__"
+    try:
+        with open(cache_path(acc, key), "r") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def response_cache_bump(acc):
+    pass  # not critical; bump via re-save semantics
+
+
+def response_cache_invalidate_account(acc):
+    for k in ("balance", "quota", "tiering", "segments-0", "segments-1", "shop-0", "shop-1", "families-0", "families-1"):
+        response_cache_delete(acc, k)
+
+
+# ---------------------------------------------------------------------------
+# shared status helpers
+# ---------------------------------------------------------------------------
+def api_auth_failed(resp):
+    if not resp:
+        return False
+    markers = ("REQUEST_MISSING_BEARER", "MISSING_BEARER", "Invalid token", "invalid_token", "Token expired",
+               "token expired", "Unauthorized", "auth_error=true", "code=132", '"code":"132"', '"code":132',
+               '"status":401', '"status":"401"')
+    return any(m in resp for m in markers)
+
+
+def api_success_response(resp):
+    o = parse_json(resp)
+    status = jget_s(o, "status")
+    code = jget_s(o, "code")
+    return status == "SUCCESS" or code == "000"
+
+
+def api_error_151(resp):
+    if not resp:
+        return False
+    o = parse_json(resp)
+    code = jget_s(o, "code")
+    return code == "151" or jget_ll(o, "code", -1) == 151
+
+
+def api_retry_auth(acc, accounts, t):
+    token_cache_delete(acc)
+    t.clear()
+    t.update({"access_token": None, "id_token": None, "refresh_token": None, "cached": False})
+    if refresh_account(acc, t):
+        return -1
+    account_sync(accounts, acc, t)
+    return 0
+
+
+def api_response_summary(resp):
+    o = parse_json(resp)
+    status = jget_s(o, "status") or "UNKNOWN"
+    code = jget_s(o, "code")
+    s = f"status={status} code={code if code is not None else 'UNKNOWN'}"
+    if api_auth_failed(resp):
+        s += " auth_error=true"
+    return s
+
+
+# ---------------------------------------------------------------------------
+# retry wrappers
+# ---------------------------------------------------------------------------
+def get_quota_retry(a, acc, t):
+    r = response_cache_load(acc, "quota", DASHBOARD_TTL)
+    if r:
+        return r
+    r = get_quota(t)
+    if api_auth_failed(r) and not api_retry_auth(acc, a, t):
+        r = get_quota(t)
+    response_cache_save(acc, "quota", r)
+    return r
+
+
+def get_balance_retry(a, acc, t):
+    r = response_cache_load(acc, "balance", DASHBOARD_TTL)
+    if r:
+        return r
+    r = get_balance_api(t)
+    if api_auth_failed(r) and not api_retry_auth(acc, a, t):
+        r = get_balance_api(t)
+    response_cache_save(acc, "balance", r)
+    return r
+
+
+def get_tiering_info_retry(a, acc, t):
+    r = response_cache_load(acc, "tiering", TIERING_TTL)
+    if r:
+        return r
+    r = get_tiering_info_api(t)
+    if api_auth_failed(r) and not api_retry_auth(acc, a, t):
+        r = get_tiering_info_api(t)
+    response_cache_save(acc, "tiering", r)
+    return r
+
+
+def get_transaction_history_retry(a, acc, t):
+    r = get_transaction_history_api(t)
+    if api_auth_failed(r) and not api_retry_auth(acc, a, t):
+        r = get_transaction_history_api(t)
+    return r
+
+
+def get_pending_transactions_retry(a, acc, t):
+    r = get_pending_transactions_api(t)
+    if api_auth_failed(r) and not api_retry_auth(acc, a, t):
+        r = get_pending_transactions_api(t)
+    return r
+
+
+def get_transaction_status_retry(a, acc, t, tx, st):
+    r = get_transaction_status_api(t, tx, st)
+    if api_auth_failed(r) and not api_retry_auth(acc, a, t):
+        r = get_transaction_status_api(t, tx, st)
+    return r
+
+
+def get_notifications_retry(a, acc, t):
+    r = get_notifications_api(t)
+    if api_auth_failed(r) and not api_retry_auth(acc, a, t):
+        r = get_notifications_api(t)
+    return r
+
+
+def get_notification_detail_once(acc, t, nid):
+    r = get_notification_detail_api(t, nid)
+    if api_auth_failed(r):
+        token_cache_delete(acc)
+        t.clear()
+    return r
+
+
+def unsubscribe_quota_once(a, acc, t, code, subtype, domain):
+    response_cache_invalidate_account(acc)
+    r = unsubscribe_quota(t, code, subtype, domain)
+    return r
+
+
+def get_store_segments_retry(a, acc, t, ent):
+    key = f"segments-{1 if ent else 0}"
+    r = response_cache_load(acc, key, STORE_TTL)
+    if r:
+        return r
+    r = get_store_segments(t, ent)
+    if api_auth_failed(r) and not api_retry_auth(acc, a, t):
+        r = get_store_segments(t, ent)
+    response_cache_save(acc, key, r)
+    return r
+
+
+def get_store_packages_retry(a, acc, t, ent):
+    key = f"shop-{1 if ent else 0}"
+    r = response_cache_load(acc, key, STORE_TTL)
+    if r:
+        return r
+    r = get_store_packages(t, acc["subscription_type"], ent)
+    if api_auth_failed(r) and not api_retry_auth(acc, a, t):
+        r = get_store_packages(t, acc["subscription_type"], ent)
+    response_cache_save(acc, key, r)
+    return r
+
+
+def get_store_family_list_retry(a, acc, t, ent):
+    key = f"families-{1 if ent else 0}"
+    r = response_cache_load(acc, key, STORE_TTL)
+    if r:
+        return r
+    r = get_store_family_list(t, acc["subscription_type"], ent)
+    if api_auth_failed(r) and not api_retry_auth(acc, a, t):
+        r = get_store_family_list(t, acc["subscription_type"], ent)
+    response_cache_save(acc, key, r)
+    return r
+
+
+def get_store_family_retry(a, acc, t, code, ent):
+    r = get_store_family_packages(t, code, ent)
+    if api_auth_failed(r) and not api_retry_auth(acc, a, t):
+        r = get_store_family_packages(t, code, ent)
+    return r
+
+
+def get_redeemables_retry(a, acc, t, ent):
+    r = get_redeemables_api(t, ent)
+    if api_auth_failed(r) and not api_retry_auth(acc, a, t):
+        r = get_redeemables_api(t, ent)
+    return r
+
+
+def get_package_detail_retry(a, acc, t, code):
+    r = get_package_detail_api(t, code)
+    if api_auth_failed(r) and not api_retry_auth(acc, a, t):
+        r = get_package_detail_api(t, code)
+    return r
+
+
+# ---------------------------------------------------------------------------
+# payment quote helpers
+# ---------------------------------------------------------------------------
+def payment_quote_load(t, option_code, q):
+    detail = get_package_detail_api(t, option_code)
+    o = parse_json(detail)
+    if not isinstance(o, dict) or "data" not in detail:
+        return -1
+    data = jdup(o, "data") or {}
+    option = jdup(data, "package_option") or {}
+    family = jdup(data, "package_family") or {}
+    variant = jdup(data, "package_detail_variant") or {}
+    option_name = jget_s(option, "name")
+    variant_name = jget_s(variant, "name")
+    family_name = jget_s(family, "name")
+    validity = jget_s(option, "validity")
+    payment_for = jget_s(family, "payment_for")
+    token = jget_s(data, "token_confirmation")
+    price = jget_llany(option, "price", -1)
+    timestamp = jget_llany(data, "timestamp", -1)
+    if not token or price < 0:
+        return -1
+    item_name = f"{variant_name} {option_name}" if (variant_name and option_name) else (option_name or variant_name or option_code)
+    if not payment_for:
+        payment_for = "BUY_PACKAGE"
+    q.update({
+        "item_code": option_code, "item_name": item_name, "family": family_name or "",
+        "validity": validity or "", "payment_for": payment_for, "token_confirmation": token,
+        "price": price, "balance": -1, "timestamp": timestamp,
+        "context": resolved_context_set(option_code, "", "", False, "NONE", 0, 0),
+    })
+    return 0
+
+
+def payment_quote_load_context(t, context, q):
+    # used for decoy: context is fully resolved; load detail and fill quote fields
+    if not (context.get("resolved") and context.get("option_code") and context.get("family_code")
+            and context.get("variant_code") and context.get("migration_type")):
+        return -1
+    detail = get_package_detail_api_ex(t, context["option_code"], context["family_code"],
+                                       context["variant_code"], context["is_enterprise"],
+                                       context["migration_type"])
+    o = parse_json(detail)
+    status = jget_s(o, "status")
+    data = jdup(o, "data")
+    option = jdup(data, "package_option")
+    if status != "SUCCESS" or not data or not option:
+        return -2 if api_error_151(detail) else (-3 if api_auth_failed(detail) else -1)
+    family = jdup(data, "package_family") or {}
+    variant = jdup(data, "package_detail_variant") or {}
+    option_name = jget_s(option, "name")
+    variant_name = jget_s(variant, "name")
+    family_name = jget_s(family, "name")
+    validity = jget_s(option, "validity")
+    payment_for = jget_s(family, "payment_for")
+    token = jget_s(data, "token_confirmation")
+    returned_option = jget_s(option, "package_option_code")
+    returned_family = jget_s(family, "package_family_code")
+    returned_variant = jget_s(variant, "package_variant_code")
+    price = jget_llany(option, "price", -1)
+    timestamp = jget_llany(data, "timestamp", -1)
+    if (returned_family and returned_family != context["family_code"]) or \
+       (returned_variant and returned_variant != context["variant_code"]):
+        return -1
+    if not returned_option or not token or price < 0:
+        return -1
+    item_name = f"{variant_name} {option_name}" if (variant_name and option_name) else (option_name or variant_name or returned_option)
+    if not payment_for:
+        payment_for = "BUY_PACKAGE"
+    q.update({
+        "item_code": returned_option, "item_name": item_name, "family": family_name or "",
+        "validity": validity or "", "payment_for": payment_for, "token_confirmation": token,
+        "price": price, "balance": -1, "timestamp": timestamp,
+    })
+    q["context"] = dict(context)
+    return 0
+
+
+def payment_quote_load_retry(a, acc, t, code, q, err_out):
+    if payment_quote_load(t, code, q) == 0:
+        return 0
+    # on auth failure error_path, retry once
+    if api_auth_failed(q.get("_last_err", "")):
+        if not api_retry_auth(acc, a, t):
+            return payment_quote_load(t, code, q)
+    return -1
+
+
+def payment_cart_context(quotes, n):
+    for q in quotes[:n]:
+        if q.get("context", {}).get("resolved"):
+            return q["context"]
+    return None
+
+
+def payment_quote_print_json(q):
+    prod = {
+        "code": q["item_code"], "name": q["item_name"], "family": q["family"],
+        "validity": q["validity"], "payment_for": q["payment_for"],
+        "price": q["price"], "timestamp": q["timestamp"],
+    }
+    out = {"product": prod, "pulsa": {"balance": q["balance"]}}
+    c = q.get("context", {})
+    if c.get("resolved"):
+        out["package_context"] = {
+            "option_code": c["option_code"], "family_code": c["family_code"], "variant_code": c["variant_code"],
+            "is_enterprise": c["is_enterprise"], "migration_type": c["migration_type"],
+            "package_number": c["package_number"],
+        }
+    return out
+
+
+def send_balance_settlement(path, payload, t, targets, token_payment, payment_for, payment_ts):
+    return api_request_payment(path, payload, t, targets, token_payment, payment_for, payment_ts)
+
+
+def payment_items_json(q, n):
+    targets = ""
+    items = []
+    for i in range(n):
+        if i:
+            targets += ";"
+        targets += q[i]["item_code"]
+        items.append({
+            "item_code": q[i]["item_code"], "product_type": "", "item_price": q[i]["price"],
+            "item_name": q[i]["item_name"], "tax": 0, "token_confirmation": q[i]["token_confirmation"],
+        })
+    return targets, items
+
+
+def payment_pulsa_settle_many_raw(acc, t, q, n, total, token_idx, payment_for_override):
+    if n < 1:
+        return '{"status":"FAILED","message":"empty cart"}'
+    ti = (token_idx + n) % n if token_idx < 0 else (token_idx if 0 <= token_idx < n else 0)
+    payment_for = payment_for_override if payment_for_override else q[0]["payment_for"]
+    ctx = payment_cart_context(q, n)
+    settlement_migration = ctx["migration_type"] if ctx else ""
+    intercept_page_api(t, q[0]["item_code"])
+    methods = payment_methods_api(t, q[ti])
+    if api_auth_failed(methods):
+        response_cache_invalidate_account(acc)
+        token_cache_delete(acc)
+    mo = parse_json(methods)
+    status = jget_s(mo, "status")
+    token_payment = jget_s(mo, "token_payment")
+    payment_ts = jget_llany(mo, "timestamp", -1)
+    if status != "SUCCESS" or not token_payment or payment_ts < 0:
+        summary = api_response_summary(methods)
+        return json.dumps({"status": "FAILED", "message": f"payment methods failed: {summary}"})
+    targets, items = payment_items_json(q, n)
+    ept = encrypted_empty_field()
+    eauth = encrypted_empty_field()
+    now = int(time.time())
+    original = q[n - 1]["price"]
+    payload = json.dumps({
+        "total_discount": 0, "is_enterprise": bool(ctx and ctx["is_enterprise"]),
+        "payment_token": "", "token_payment": token_payment, "activated_autobuy_code": "",
+        "cc_payment_type": "", "is_myxl_wallet": False, "pin": "", "ewallet_promo_id": "", "members": [],
+        "total_fee": 0, "fingerprint": "", "autobuy_threshold_setting": {"label": "", "type": "", "value": 0},
+        "is_use_point": False, "lang": "en", "payment_method": "BALANCE", "timestamp": now,
+        "points_gained": 0, "can_trigger_rating": False, "akrab_members": [], "akrab_parent_alias": "",
+        "referral_unique_code": "", "coupon": "", "payment_for": payment_for, "with_upsell": False,
+        "topup_number": "", "stage_token": "", "authentication_id": "", "encrypted_payment_token": ept,
+        "token": "", "token_confirmation": "", "access_token": t["access_token"], "wallet_number": "",
+        "encrypted_authentication_id": eauth,
+        "additional_data": {
+            "original_price": original, "is_spend_limit_temporary": False, "migration_type": settlement_migration,
+            "akrab_m2m_group_id": "false", "spend_limit_amount": 0, "is_spend_limit": False, "mission_id": "",
+            "tax": 0, "quota_bonus": 0, "cashtag": "", "is_family_plan": False, "combo_details": [],
+            "is_switch_plan": False, "discount_recurring": 0, "is_akrab_m2m": False, "balance_type": "PREPAID_BALANCE",
+            "has_bonus": False, "discount_promo": 0,
+        },
+        "total_amount": total, "is_using_autobuy": False, "items": items,
+    })
+    response_cache_invalidate_account(acc)
+    resp = send_balance_settlement("payments/api/v8/settlement-multipayment", payload, t, targets, token_payment, payment_for, payment_ts)
+    response_cache_invalidate_account(acc)
+    if api_auth_failed(resp):
+        token_cache_delete(acc)
+        t.clear()
+    return resp
+
+
+def payment_response_add_context(response, context):
+    if not response or not context or not context.get("resolved"):
+        return response
+    o = parse_json(response)
+    if isinstance(o, dict) and o.get("status") == "SUCCESS":
+        return response
+    if isinstance(o, dict):
+        o["package_context"] = {
+            "option_code": context["option_code"], "family_code": context["family_code"],
+            "package_number": context["package_number"], "variant_code": context["variant_code"],
+            "is_enterprise": context["is_enterprise"], "migration_type": context["migration_type"],
+        }
+        return json.dumps(o)
+    return json.dumps({"status": "FAILED", "message": "settlement gagal", "package_context": {
+        "option_code": context["option_code"], "family_code": context["family_code"],
+        "package_number": context["package_number"], "variant_code": context["variant_code"],
+        "is_enterprise": context["is_enterprise"], "migration_type": context["migration_type"],
+    }})
+
+
+def payment_pulsa_settle_many(acc, t, q, n, total):
+    return payment_pulsa_settle_many_raw(acc, t, q, n, total, 0, None)
+
+
+def payment_ok_status(status):
+    return status == "SUCCESS"
+
+
+def payment_amount(total, custom_amount):
+    return custom_amount if custom_amount >= 0 else total
+
+
+def payment_bizz_amount(resp):
+    o = parse_json(resp)
+    if not isinstance(o, dict):
+        return -1
+    status = jget_s(o, "status")
+    message = jget_s(o, "message")
+    if status == "SUCCESS" or not message:
+        return -1
+    p = message.find("Bizz-err.Amount.Total")
+    if p < 0:
+        return -1
+    p = message.find("=", p)
+    if p < 0:
+        return -1
+    try:
+        v = int(message[p + 1:].lstrip().split()[0].split(",")[0] if message[p + 1:].lstrip() else "")
+        return v if v >= 0 else -1
+    except Exception:
+        return -1
+
+
+def payment_pulsa_settle_retry(acc, t, q, n, amount_v, token_idx, payment_for_override):
+    amount = amount_v[0]
+    context = payment_cart_context(q, n)
+    resp = payment_pulsa_settle_many_raw(acc, t, q, n, amount, token_idx, payment_for_override)
+    o = parse_json(resp)
+    status = jget_s(o, "status")
+    valid = -1 if payment_ok_status(status) else payment_bizz_amount(resp)
+    if valid < 0:
+        return payment_response_add_context(resp, context)
+    amount_v[0] = valid
+    resp = payment_pulsa_settle_many_raw(acc, t, q, n, valid, token_idx, payment_for_override)
+    return payment_response_add_context(resp, context)
+
+
+def payment_qris_settle_many_ex(acc, t, q, n, total, token_idx, payment_for_override):
+    if n < 1:
+        return '{"status":"FAILED","message":"empty cart"}'
+    ti = (token_idx + n) % n if token_idx < 0 else (token_idx if 0 <= token_idx < n else 0)
+    payment_for = payment_for_override if payment_for_override else q[0]["payment_for"]
+    ctx = payment_cart_context(q, n)
+    settlement_migration = ctx["migration_type"] if ctx else ""
+    intercept_page_api(t, q[0]["item_code"])
+    methods = payment_methods_api(t, q[ti])
+    mo = parse_json(methods)
+    status = jget_s(mo, "status")
+    token_payment = jget_s(mo, "token_payment")
+    payment_ts = jget_llany(mo, "timestamp", -1)
+    if status != "SUCCESS" or not token_payment or payment_ts < 0:
+        return json.dumps({"status": "FAILED", "message": "payment methods QRIS failed"})
+    targets, items = payment_items_json(q, n)
+    now = int(time.time())
+    original = q[0]["price"]
+    payload = json.dumps({
+        "akrab": {"akrab_members": [], "akrab_parent_alias": "", "members": []},
+        "can_trigger_rating": False, "total_discount": 0, "coupon": "", "payment_for": payment_for,
+        "topup_number": "", "stage_token": "", "is_enterprise": bool(ctx and ctx["is_enterprise"]),
+        "autobuy": {"is_using_autobuy": False, "activated_autobuy_code": "", "autobuy_threshold_setting": {"label": "", "type": "", "value": 0}},
+        "access_token": t["access_token"], "is_myxl_wallet": False,
+        "additional_data": {
+            "original_price": original, "is_spend_limit_temporary": False, "migration_type": settlement_migration,
+            "spend_limit_amount": 0, "is_spend_limit": False, "tax": 0, "benefit_type": "", "quota_bonus": 0,
+            "cashtag": "", "is_family_plan": False, "combo_details": [], "is_switch_plan": False,
+            "discount_recurring": 0, "has_bonus": False, "discount_promo": 0,
+        },
+        "total_amount": total, "total_fee": 0, "is_use_point": False, "lang": "en", "items": items,
+        "verification_token": token_payment, "payment_method": "QRIS", "timestamp": now,
+    })
+    response_cache_invalidate_account(acc)
+    resp = api_request_payment_method("payments/api/v8/settlement-multipayment/qris", payload, t, targets, token_payment, "QRIS", payment_for, payment_ts)
+    response_cache_invalidate_account(acc)
+    if api_auth_failed(resp):
+        token_cache_delete(acc)
+        t.clear()
+    return payment_response_add_context(resp, ctx)
+
+
+def payment_ewallet_settle_many(acc, t, q, n, total, method, wallet):
+    if n < 1:
+        return '{"status":"FAILED","message":"empty cart"}'
+    intercept_page_api(t, q[0]["item_code"])
+    methods = payment_methods_api(t, q[0])
+    mo = parse_json(methods)
+    status = jget_s(mo, "status")
+    token_payment = jget_s(mo, "token_payment")
+    payment_ts = jget_llany(mo, "timestamp", -1)
+    if status != "SUCCESS" or not token_payment or payment_ts < 0:
+        return json.dumps({"status": "FAILED", "message": "payment methods failed"})
+    targets, items = payment_items_json(q, n)
+    now = int(time.time())
+    payload = json.dumps({
+        "akrab": {"akrab_members": [], "akrab_parent_alias": "", "members": []},
+        "can_trigger_rating": False, "total_discount": 0, "coupon": "", "payment_for": q[0]["payment_for"],
+        "topup_number": "", "is_enterprise": False,
+        "autobuy": {"is_using_autobuy": False, "activated_autobuy_code": "", "autobuy_threshold_setting": {"label": "", "type": "", "value": 0}},
+        "cc_payment_type": "", "access_token": t["access_token"], "is_myxl_wallet": False,
+        "wallet_number": wallet, "additional_data": {}, "total_amount": total, "total_fee": 0,
+        "is_use_point": False, "lang": "en", "items": items, "verification_token": token_payment,
+        "payment_method": method, "timestamp": now,
+    })
+    response_cache_invalidate_account(acc)
+    resp = api_request_payment_method("payments/api/v8/settlement-multipayment/ewallet", payload, t, targets, token_payment, method, q[0]["payment_for"], payment_ts)
+    response_cache_invalidate_account(acc)
+    if api_auth_failed(resp):
+        token_cache_delete(acc)
+        t.clear()
+    return resp
+
+
+def payment_voucher_settle(acc, t, q):
+    if q["timestamp"] < 0:
+        return '{"status":"FAILED","message":"missing package timestamp"}'
+    ept = encrypted_empty_field()
+    eauth = encrypted_empty_field()
+    payload = json.dumps({
+        "total_discount": 0, "is_enterprise": False, "payment_token": "", "token_payment": "",
+        "activated_autobuy_code": "", "cc_payment_type": "", "is_myxl_wallet": False, "pin": "",
+        "ewallet_promo_id": "", "members": [], "total_fee": 0, "fingerprint": "",
+        "autobuy_threshold_setting": {"label": "", "type": "", "value": 0}, "is_use_point": False,
+        "lang": "en", "payment_method": "BALANCE", "timestamp": q["timestamp"], "points_gained": 0,
+        "can_trigger_rating": False, "akrab_members": [], "akrab_parent_alias": "", "referral_unique_code": "",
+        "coupon": "", "payment_for": "REDEEM_VOUCHER", "with_upsell": False, "topup_number": "",
+        "stage_token": "", "authentication_id": "", "encrypted_payment_token": ept, "token": "",
+        "token_confirmation": q["token_confirmation"], "access_token": t["access_token"], "wallet_number": "",
+        "encrypted_authentication_id": eauth,
+        "additional_data": {
+            "original_price": 0, "is_spend_limit_temporary": False, "migration_type": "",
+            "akrab_m2m_group_id": "", "spend_limit_amount": 0, "is_spend_limit": False, "mission_id": "",
+            "tax": 0, "benefit_type": "", "quota_bonus": 0, "cashtag": "", "is_family_plan": False,
+            "combo_details": [], "is_switch_plan": False, "discount_recurring": 0, "is_akrab_m2m": False,
+            "balance_type": "", "has_bonus": False, "discount_promo": 0,
+        },
+        "total_amount": 0, "is_using_autobuy": False,
+        "items": [{"item_code": q["item_code"], "product_type": "", "item_price": q["price"], "item_name": q["item_name"], "tax": 0}],
+    })
+    sig = make_x_signature_bounty(t["access_token"], q["timestamp"], q["item_code"], q["token_confirmation"])
+    response_cache_invalidate_account(acc)
+    resp = api_request_custom_sig("api/v8/personalization/bounties-exchange", payload, t, sig)
+    response_cache_invalidate_account(acc)
+    return resp
+
+
+def payment_point_settle(acc, t, q):
+    if q["timestamp"] < 0:
+        return '{"status":"FAILED","message":"missing package timestamp"}'
+    path = "gamification/api/v8/loyalties/tiering/exchange"
+    payload = json.dumps({
+        "item_code": q["item_code"], "amount": 0, "partner": "", "is_enterprise": False,
+        "item_name": "", "lang": "en", "points": q["price"], "timestamp": q["timestamp"],
+        "token_confirmation": q["token_confirmation"],
+    })
+    sig = make_x_signature_loyalty(q["timestamp"], q["item_code"], q["token_confirmation"], path)
+    response_cache_invalidate_account(acc)
+    resp = api_request_custom_sig(path, payload, t, sig)
+    response_cache_invalidate_account(acc)
+    return resp
+
+
+def payment_gift_settle(acc, t, q, dest):
+    if q["timestamp"] < 0:
+        return '{"status":"FAILED","message":"missing package timestamp"}'
+    path = "gamification/api/v8/loyalties/tiering/bounties-allotment"
+    now = int(time.time())
+    payload = json.dumps({
+        "destination_msisdn": dest, "item_code": q["item_code"], "is_enterprise": False,
+        "item_name": q["item_name"], "lang": "en", "timestamp": now, "token_confirmation": q["token_confirmation"],
+    })
+    sig = make_x_signature_bounty_allotment(q["timestamp"], q["item_code"], q["token_confirmation"], path, dest)
+    response_cache_invalidate_account(acc)
+    resp = api_request_custom_sig(path, payload, t, sig)
+    response_cache_invalidate_account(acc)
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# decoy resolution
+# ---------------------------------------------------------------------------
+PREPAID_BUILTIN = ("b0a20d74-0c54-4e3b-8f3f-01e7482e50bf", "719d093f-6f8d-46a4-8390-6a0003a172ea", 1, "true", "NONE")
+PRIO_BUILTIN = ("2512b72a-a3cd-4c70-a736-132cf2c1f0c0", "cff298bd-8ec8-4696-b689-12407d36be15", 1, "", "")
+
+
+def subscription_upper(acc):
+    return (acc.get("subscription_type") or "").upper()
+
+
+def subscription_priohybrid(acc):
+    return subscription_upper(acc) == "PRIOHYBRID"
+
+
+def subscription_prio(acc):
+    return subscription_upper(acc) in ("PRIORITAS", "PRIOHYBRID", "GO")
+
+
+def decoy_family_code_valid(s):
+    return bool(s) and 1 <= len(s) <= 128 and not any(ch.isspace() or ord(ch) < 32 for ch in s)
+
+
+def decoy_package_number_parse(s):
+    if not s:
+        return None
+    try:
+        v = int(s)
+    except ValueError:
+        return None
+    return v if 1 <= v <= 2147483647 else None
+
+
+def decoy_config_choice(acc):
+    # returns (configured, category, family_code, package_number, prioritas_fallback)
+    if subscription_priohybrid(acc):
+        if CFG["DECOY_PRIOHYBRID_FAMILY_CODE"] or CFG["DECOY_PRIOHYBRID_PACKAGE_NUMBER"]:
+            return ("PRIOHYBRID", CFG["DECOY_PRIOHYBRID_FAMILY_CODE"], CFG["DECOY_PRIOHYBRID_PACKAGE_NUMBER"], False)
+        return ("PRIORITAS", CFG["DECOY_PRIORITAS_FAMILY_CODE"], CFG["DECOY_PRIORITAS_PACKAGE_NUMBER"], True)
+    if subscription_prio(acc):
+        return ("PRIORITAS", CFG["DECOY_PRIORITAS_FAMILY_CODE"], CFG["DECOY_PRIORITAS_PACKAGE_NUMBER"], False)
+    return ("PREPAID", CFG["DECOY_PREPAID_FAMILY_CODE"], CFG["DECOY_PREPAID_PACKAGE_NUMBER"], False)
+
+
+def family_variant_order_context(t, family_code, variant_code, order, enterprise_arg, migration_arg, context, err_out=None):
+    result = [-1]
+    shop = get_store_family_packages_context_result(t, family_code, enterprise_arg, migration_arg, context, result)
+    context["variant_code"] = variant_code
+    if result[0] != 0:
+        return result[0]
+    o = parse_json(shop)
+    data = jdup(o, "data") if isinstance(o, dict) else shop
+    variants = (data.get("package_variants") if isinstance(data, dict) else None) or []
+    flattened = 0
+    found = None
+    for variant in variants:
+        vc = variant.get("package_variant_code") if isinstance(variant, dict) else None
+        for option in (variant.get("package_options") or []) if isinstance(variant, dict) else []:
+            flat_order = option.get("order", -1) if isinstance(option, dict) else -1
+            flattened += 1
+            if vc == variant_code and flat_order == order:
+                found = option.get("package_option_code")
+                break
+        if found:
+            break
+    if found:
+        context.update(resolved_context_set(found, context.get("family_code", ""), variant_code,
+                                            context.get("is_enterprise", False),
+                                            context.get("migration_type", "NONE"),
+                                            flattened, 1))
+        return 0
+    return -1
+
+
+def decoy_package_context_once(t, acc, context, err_out=None):
+    choice = decoy_config_choice(acc)
+    category, fam, num, fallback = choice
+    has_family = bool(fam)
+    has_number = bool(num)
+    if has_family != has_number:
+        return -1
+    if has_family:
+        if not decoy_family_code_valid(fam):
+            return -1
+        pn = decoy_package_number_parse(num)
+        if pn is None:
+            return -1
+        result = [-1]
+        shop = get_store_family_packages_context_result(t, fam, None, None, context, result)
+        context["package_number"] = pn
+        if result[0] == 0:
+            # flatten to option code at package_number
+            o = parse_json(shop)
+            data = (jdup(o, "data") if isinstance(o, dict) else None) or {}
+            variants = data.get("package_variants") or []
+            idx = 0
+            found = None
+            found_variant = None
+            for variant in variants:
+                vc = variant.get("package_variant_code")
+                for option in (variant.get("package_options") or []):
+                    idx += 1
+                    if idx == pn:
+                        found = option.get("package_option_code")
+                        found_variant = vc
+                        break
+                if found:
+                    break
+            if found and found_variant:
+                context.update(resolved_context_set(found, fam, found_variant,
+                                                    context.get("is_enterprise", False),
+                                                    context.get("migration_type", "NONE"),
+                                                    pn, 1))
+                return 0
+        return -1
+    if subscription_prio(acc):
+        return family_variant_order_context(t, *PRIO_BUILTIN, context, err_out)
+    return family_variant_order_context(t, *PREPAID_BUILTIN, context, err_out)
+
+
+def decoy_quote_resolve(accounts, acc, t, quote, option_code_out, err_out):
+    context = {}
+    result = decoy_package_context_once(t, acc, context, err_out)
+    if result:
+        return -1
+    result = payment_quote_load_context(t, context, quote)
+    if result == 0 and option_code_out is not None:
+        option_code_out[0] = quote["item_code"]
+    return result if result != 0 else 0
+
+
+# ---------------------------------------------------------------------------
+# msisdn helpers
+# ---------------------------------------------------------------------------
+def normalize_msisdn(inp):
+    digits = "".join(ch for ch in (inp or "") if ch.isdigit())
+    if digits.startswith("08"):
+        return "62" + digits[1:]
+    if digits.startswith("8"):
+        return "62" + digits
+    return digits
+
+
+def msisdn_ok(s):
+    if not s.startswith("628"):
+        return False
+    if len(s) < 8 or len(s) > 14:
+        return False
+    return s.isdigit()
+
+
+def login_msisdn(inp):
+    number = normalize_msisdn(inp)
+    if msisdn_ok(number):
+        return number
+    return None
+
+
+def otp_ok(s):
+    return bool(s) and len(s) == 6 and s.isdigit()
+
+
+def wallet_api_number(inp):
+    digits = "".join(ch for ch in (inp or "") if ch.isdigit())
+    if digits.startswith("628"):
+        return "0" + digits[2:]
+    if digits.startswith("8"):
+        return "0" + digits
+    return digits
+
+
+def dest_msisdn(inp):
+    digits = "".join(ch for ch in (inp or "") if ch.isdigit())
+    if digits.startswith("08"):
+        return "62" + digits[1:]
+    if digits.startswith("8"):
+        return "62" + digits
+    return digits
+
+
+def family_code_ok(s):
+    return bool(s) and 1 <= len(s) <= 128 and not any(ord(ch) < 32 or ch.isspace() for ch in s)
+
+
+def purchase_code_ok(s):
+    return bool(s) and 1 <= len(s) <= 255 and not any(ord(ch) < 32 or ch.isspace() for ch in s)
+
+
+def notification_id_ok(s):
+    return bool(s) and 1 <= len(s) <= 256 and not any(ord(ch) < 32 or ch.isspace() for ch in s)
+
+
+# ---------------------------------------------------------------------------
+# json output helpers
+# ---------------------------------------------------------------------------
+def out_json(obj):
+    print(json.dumps(obj, ensure_ascii=False))
+
+
+def json_require_config():
+    m = config_missing()
+    if not m:
+        return False
+    out_json({"ok": False, "error": "missing env", "missing": m})
+    return True
+
+
+def json_auth_error(resp):
+    out_json({"ok": False, "error": "auth failed", "response": jval(resp)})
+
+
+def json_accounts_fields(a, act):
+    return {
+        "active": act or "",
+        "accounts": [
+            {"number": it["number"], "subscription_type": it["subscription_type"], "active": it["number"] == act}
+            for it in a
+        ],
+    }
+
+
+def load_active_account(err_label="no active account"):
+    """Returns (accounts, act, acc) or (None,None,None) with an error printed."""
+    a = accounts_load()
+    act = active_get()
+    acc = accounts_find(a, act) if act else None
+    if not acc:
+        out_json({"ok": False, "error": err_label, "active": act or ""})
+        return None, None, None
+    return a, act, acc
+
+
+def json_payment_begin():
+    a, act, acc = load_active_account()
+    if not acc:
+        return None, None, None, None
+    t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+    if refresh_account(acc, t):
+        out_json({"ok": False, "error": "refresh failed", "number": acc["number"]})
+        return None, None, None, None
+    account_sync(a, acc, t)
+    return a, act, acc, t
+
+
+def load_payment_quotes_json(a, acc, t, n, codes, q, max_n, total, loaded):
+    if n < 1:
+        out_json({"ok": False, "error": "missing package code"})
+        return -1
+    if n > max_n:
+        out_json({"ok": False, "error": f"cart max {max_n} packages"})
+        return -1
+    total[0] = 0
+    loaded[0] = 0
+    for i in range(n):
+        qq = empty_quote()
+        if payment_quote_load(t, codes[i], qq):
+            out_json({"ok": False, "error": "quote failed", "index": i, "code": codes[i]})
+            return -1
+        total[0] += qq["price"]
+        q.append(qq)
+        loaded[0] += 1
+    return 0
+
+
+def empty_quote():
+    return {"item_code": "", "item_name": "", "family": "", "validity": "", "payment_for": "",
+            "token_confirmation": "", "price": 0, "balance": -1, "timestamp": -1,
+            "context": resolved_context_set("", "", "", False, "NONE", 0, 0)}
+
+
+def print_quotes_json(quotes):
+    return [payment_quote_print_json(q) for q in quotes]
+
+
+def print_amount_json(total, amount):
+    if amount != total:
+        return {"total_amount": amount, "custom_price": amount}
+    return {"total_amount": amount}
+
+
+def strip_custom_amount_args(argv):
+    custom = -1
+    out = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        handled = False
+        for flag in ("--amount", "--price", "--custom-price"):
+            if a == flag:
+                if i + 1 >= len(argv):
+                    return None, None
+                custom = int(argv[i + 1]) if argv[i + 1].isdigit() else -1
+                i += 2
+                handled = True
+                break
+        if not handled:
+            out.append(a)
+            i += 1
+    return out, custom
+
+
+def confirm_arg_ok(s):
+    return s in ("1", "true", "yes", "CONFIRM", "confirm")
+
+
+def strip_json_confirm_args(argv):
+    confirmed = False
+    out = []
+    for a in argv:
+        if a in ("--confirm", "confirm"):
+            confirmed = True
+            continue
+        if a.startswith("confirm="):
+            v = a[8:]
+            if confirm_arg_ok(v):
+                confirmed = True
+            else:
+                return None, None
+            continue
+        if a.startswith("confirmed="):
+            v = a[10:]
+            if confirm_arg_ok(v):
+                confirmed = True
+            else:
+                return None, None
+            continue
+        out.append(a)
+    return out, confirmed
+
+
+def require_json_payment_confirmed():
+    global json_payment_confirmed
+    if json_payment_confirmed:
+        return False
+    out_json({"ok": False, "error": "confirm required", "confirm": "confirm=1"})
+    return True
+
+
+# ---------------------------------------------------------------------------
+# json commands
+# ---------------------------------------------------------------------------
+def cmd_json_dashboard():
+    a, act, acc = load_active_account()
+    if not acc:
+        return
+    t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+    if refresh_account(acc, t):
+        out_json({"ok": False, "error": "refresh failed", "number": acc["number"]})
+        return
+    account_sync(a, acc, t)
+    bal = get_balance_retry(a, acc, t)
+    quota = get_quota_retry(a, acc, t)
+    if api_auth_failed(bal) or api_auth_failed(quota):
+        out_json({"ok": False, "error": "auth failed", "number": acc["number"], "balance": jval(bal), "quota": jval(quota)})
+        return
+    out_json({"ok": True, "number": acc["number"], "subscription_type": acc["subscription_type"],
+              "balance": jval(bal), "quota": jval(quota)})
+
+
+def cmd_json_accounts():
+    a = accounts_load()
+    act = active_get()
+    out = {"ok": True}
+    out.update(json_accounts_fields(a, act))
+    out_json(out)
+
+
+def cmd_json_env():
+    prepaid_valid = decoy_package_number_parse(CFG["DECOY_PREPAID_PACKAGE_NUMBER"]) is not None
+    prior_valid = decoy_package_number_parse(CFG["DECOY_PRIORITAS_PACKAGE_NUMBER"]) is not None
+    hybrid_valid = decoy_package_number_parse(CFG["DECOY_PRIOHYBRID_PACKAGE_NUMBER"]) is not None
+    env = {
+        "BASE_API_URL": bool(CFG["BASE_API_URL"]), "BASE_CIAM_URL": bool(CFG["BASE_CIAM_URL"]),
+        "BASIC_AUTH": bool(CFG["BASIC_AUTH"]), "AX_FP_KEY": bool(CFG["AX_FP_KEY"]),
+        "UA": bool(CFG["UA"]), "API_KEY": bool(CFG["API_KEY"]),
+        "ENCRYPTED_FIELD_KEY": bool(CFG["ENCRYPTED_FIELD_KEY"]), "XDATA_KEY": bool(CFG["XDATA_KEY"]),
+        "AX_API_SIG_KEY": bool(CFG["AX_API_SIG_KEY"]), "X_API_BASE_SECRET": bool(CFG["X_API_BASE_SECRET"]),
+        "DECOY_PREPAID_FAMILY_CODE": bool(CFG["DECOY_PREPAID_FAMILY_CODE"]),
+        "DECOY_PREPAID_PACKAGE_NUMBER": prepaid_valid,
+        "DECOY_PRIORITAS_FAMILY_CODE": bool(CFG["DECOY_PRIORITAS_FAMILY_CODE"]),
+        "DECOY_PRIORITAS_PACKAGE_NUMBER": prior_valid,
+        "DECOY_PRIOHYBRID_FAMILY_CODE": bool(CFG["DECOY_PRIOHYBRID_FAMILY_CODE"]),
+        "DECOY_PRIOHYBRID_PACKAGE_NUMBER": hybrid_valid,
+    }
+    out_json({"ok": True, "home": CFG["home"], "env_path": CFG["env_path"], "env": env, "libmbedcrypto": True})
+
+
+def cmd_json_quota(number_arg, fresh):
+    a = accounts_load()
+    act = None
+    number = number_arg
+    if not number:
+        act = active_get()
+        number = act
+    acc = accounts_find(a, number) if number else None
+    if not acc:
+        out_json({"ok": False, "error": "account not found", "active": number or ""})
+        return
+    t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+    if refresh_account(acc, t):
+        out_json({"ok": False, "error": "refresh failed", "number": acc["number"]})
+        return
+    account_sync(a, acc, t)
+    if fresh:
+        response_cache_delete(acc, "quota")
+    quota = get_quota_retry(a, acc, t)
+    if api_auth_failed(quota):
+        json_auth_error(quota)
+    else:
+        print(quota)
+
+
+def cmd_json_tiering():
+    a, act, acc = load_active_account()
+    if not acc:
+        return
+    t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+    if refresh_account(acc, t):
+        out_json({"ok": False, "error": "refresh failed", "number": acc["number"]})
+        return
+    account_sync(a, acc, t)
+    tier = get_tiering_info_retry(a, acc, t)
+    out_json({"ok": not api_auth_failed(tier), "number": acc["number"],
+              "subscription_type": acc["subscription_type"], "tiering": jval(tier)})
+
+
+def cmd_json_transaction_history():
+    a, act, acc = load_active_account()
+    if not acc:
+        return
+    t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+    if refresh_account(acc, t):
+        out_json({"ok": False, "error": "refresh failed", "number": acc["number"]})
+        return
+    account_sync(a, acc, t)
+    history = get_transaction_history_retry(a, acc, t)
+    o = parse_json(history)
+    ok = not api_auth_failed(history) and isinstance(o, dict) and any(
+        isinstance(o.get(k), list) for k in ("list", "transaction_history", "history", "transactions"))
+    out = {"ok": ok, "number": acc["number"], "subscription_type": acc["subscription_type"], "history": jval(history)}
+    if not ok:
+        out["error"] = "transaction history failed"
+    out_json(out)
+
+
+def cmd_json_pending_transactions():
+    a, act, acc = load_active_account()
+    if not acc:
+        return
+    t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+    if refresh_account(acc, t):
+        out_json({"ok": False, "error": "refresh failed", "number": acc["number"]})
+        return
+    account_sync(a, acc, t)
+    pending = get_pending_transactions_retry(a, acc, t)
+    o = parse_json(pending)
+    ok = not api_auth_failed(pending) and api_success_response(pending)
+    has_pending = False
+    if isinstance(o, dict):
+        pp = o.get("pending_payment")
+        has_pending = isinstance(pp, list) and len(pp) > 0
+    out = {"ok": ok, "has_pending_payment": has_pending, "number": acc["number"],
+           "subscription_type": acc["subscription_type"], "pending": jval(pending)}
+    if not ok:
+        out["error"] = "pending transactions failed"
+    out_json(out)
+
+
+def cmd_json_transaction_status(tx, status_arg):
+    if not tx:
+        out_json({"ok": False, "error": "missing transaction id"})
+        return
+    a, act, acc = load_active_account()
+    if not acc:
+        return
+    t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+    if refresh_account(acc, t):
+        out_json({"ok": False, "error": "refresh failed", "number": acc["number"]})
+        return
+    account_sync(a, acc, t)
+    detail = get_transaction_status_retry(a, acc, t, tx, status_arg or "")
+    ok = not api_auth_failed(detail) and api_success_response(detail)
+    out = {"ok": ok, "transaction_id": tx, "status_arg": status_arg or "", "detail": jval(detail)}
+    if not ok:
+        out["error"] = "transaction status failed"
+    out_json(out)
+
+
+def cmd_json_notifications():
+    a, act, acc = load_active_account()
+    if not acc:
+        return
+    t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+    if refresh_account(acc, t):
+        out_json({"ok": False, "error": "refresh failed", "number": acc["number"]})
+        return
+    account_sync(a, acc, t)
+    notifications = get_notifications_retry(a, acc, t)
+    ok = not api_auth_failed(notifications) and api_success_response(notifications)
+    out = {"ok": ok, "number": acc["number"], "subscription_type": acc["subscription_type"], "notifications": jval(notifications)}
+    if not ok:
+        out["error"] = "notifications failed"
+    out_json(out)
+
+
+def cmd_json_notification_read(ids):
+    if len(ids) < 1:
+        out_json({"ok": False, "error": "missing notification id"})
+        return
+    if len(ids) > 64:
+        out_json({"ok": False, "error": "too many notification ids", "limit": 64})
+        return
+    for i, nid in enumerate(ids):
+        if not notification_id_ok(nid):
+            out_json({"ok": False, "error": "invalid notification id", "index": i})
+            return
+    a, act, acc = load_active_account()
+    if not acc:
+        return
+    t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+    if refresh_account(acc, t):
+        out_json({"ok": False, "error": "refresh failed", "number": acc["number"]})
+        return
+    account_sync(a, acc, t)
+    results = []
+    marked = 0
+    attempted = 0
+    auth_failed = False
+    for nid in ids:
+        detail = get_notification_detail_once(acc, t, nid)
+        auth = api_auth_failed(detail)
+        ok = (not auth) and api_success_response(detail)
+        results.append({"notification_id": nid, "ok": ok, "response": jval(detail)})
+        attempted += 1
+        if ok:
+            marked += 1
+        if auth:
+            auth_failed = True
+            break
+    out = {"results": results, "ok": marked == len(ids), "requested": len(ids), "attempted": attempted, "marked": marked}
+    if auth_failed:
+        out["error"] = "auth failed; retry action manually"
+    elif marked != len(ids):
+        out["error"] = "one or more notifications failed"
+    out_json(out)
+
+
+def cmd_json_use(number):
+    a = accounts_load()
+    acc = accounts_find(a, number)
+    if not acc:
+        out_json({"ok": False, "error": "account not found"})
+        return
+    active_set(number)
+    out_json({"ok": True, "active": number})
+
+
+def cmd_json_del(number):
+    a = accounts_load()
+    if not accounts_find(a, number):
+        out_json({"ok": False, "error": "account not found"})
+        return
+    delete_account_number(number)
+    out_json({"ok": True})
+
+
+def cmd_json_logout():
+    act = active_get()
+    a = accounts_load()
+    acc = accounts_find(a, act) if act else None
+    if acc:
+        token_cache_delete(acc)
+        response_cache_invalidate_account(acc)
+    active_set("")
+    out_json({"ok": True, "previous_active": act or ""})
+
+
+def cmd_json_login(inp):
+    number = login_msisdn(inp)
+    if not number:
+        out_json({"ok": False, "error": "number must use 08 or 628 format"})
+        return
+    resp = request_otp(number)
+    ok = "subscriber_id" in resp
+    out_json({"ok": ok, "response": jval(resp)})
+
+
+def cmd_json_otp(inp, code):
+    number = login_msisdn(inp)
+    if not number:
+        out_json({"ok": False, "error": "number must use 08 or 628 format"})
+        return
+    if not otp_ok(code):
+        out_json({"ok": False, "error": "otp must be 6 digits"})
+        return
+    resp = submit_otp("SMS", number, code)
+    t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+    if parse_tokens(resp, t):
+        out_json({"ok": False, "response": jval(resp)})
+        return
+    profile = get_profile(t)
+    po = parse_json(profile)
+    sub = jget_s(po, "subscriber_id") or ""
+    typ = jget_s(po, "subscription_type") or ""
+    a = accounts_load()
+    accounts_put(a, number, sub, typ, t["refresh_token"])
+    saved = accounts_find(a, number)
+    if saved:
+        token_cache_save(saved, t)
+    accounts_save(a)
+    active_set(number)
+    out_json({"ok": True, "number": number, "subscription_type": typ or "unknown"})
+
+
+def cmd_json_unsub(code, subtype, domain):
+    a, act, acc = load_active_account()
+    if not acc:
+        return
+    if not code:
+        out_json({"ok": False, "error": "missing quota code"})
+        return
+    t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+    if refresh_account(acc, t):
+        out_json({"ok": False, "error": "refresh failed", "number": acc["number"]})
+        return
+    account_sync(a, acc, t)
+    res = unsubscribe_quota_once(a, acc, t, code, subtype or "", domain or "")
+    ok = (not api_auth_failed(res)) and api_success_response(res)
+    out_json({"ok": ok, "response": jval(res)})
+
+
+def cmd_json_redeemables(enterprise_arg):
+    a, act, acc = load_active_account()
+    if not acc:
+        return
+    t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+    if refresh_account(acc, t):
+        out_json({"ok": False, "error": "refresh failed", "number": acc["number"]})
+        return
+    account_sync(a, acc, t)
+    res = get_redeemables_retry(a, acc, t, is_true(enterprise_arg))
+    if api_auth_failed(res):
+        json_auth_error(res)
+        return
+    o = parse_json(res)
+    ok = api_success_response(res) and isinstance(o, dict) and isinstance(o.get("categories"), list)
+    out = {"ok": ok, "number": acc["number"], "subscription_type": acc["subscription_type"], "redeemables": jval(res)}
+    if not ok:
+        out["error"] = "redeemables failed"
+    out_json(out)
+
+
+def cmd_json_store_segments(enterprise_arg):
+    a, act, acc = load_active_account()
+    if not acc:
+        return
+    t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+    if refresh_account(acc, t):
+        out_json({"ok": False, "error": "refresh failed", "number": acc["number"]})
+        return
+    account_sync(a, acc, t)
+    segments = get_store_segments_retry(a, acc, t, is_true(enterprise_arg))
+    if api_auth_failed(segments):
+        json_auth_error(segments)
+        return
+    out_json({"ok": True, "number": acc["number"], "store_segments": jval(segments)})
+
+
+def cmd_json_shop(enterprise_arg):
+    a, act, acc = load_active_account()
+    if not acc:
+        return
+    t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+    if refresh_account(acc, t):
+        out_json({"ok": False, "error": "refresh failed", "number": acc["number"]})
+        return
+    account_sync(a, acc, t)
+    shop = get_store_packages_retry(a, acc, t, is_true(enterprise_arg))
+    if api_auth_failed(shop):
+        json_auth_error(shop)
+        return
+    out_json({"ok": True, "number": acc["number"], "subscription_type": acc["subscription_type"], "shop": jval(shop)})
+
+
+def cmd_json_shop_family_list(enterprise_arg):
+    a, act, acc = load_active_account()
+    if not acc:
+        return
+    t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+    if refresh_account(acc, t):
+        out_json({"ok": False, "error": "refresh failed", "number": acc["number"]})
+        return
+    account_sync(a, acc, t)
+    families = get_store_family_list_retry(a, acc, t, is_true(enterprise_arg))
+    if api_auth_failed(families):
+        json_auth_error(families)
+        return
+    out_json({"ok": True, "number": acc["number"], "subscription_type": acc["subscription_type"], "family_list": jval(families)})
+
+
+def cmd_json_shop_family(family_code, enterprise_arg):
+    if not family_code_ok(family_code):
+        out_json({"ok": False, "error": "invalid family code"})
+        return
+    a, act, acc = load_active_account()
+    if not acc:
+        return
+    t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+    if refresh_account(acc, t):
+        out_json({"ok": False, "error": "refresh failed", "number": acc["number"]})
+        return
+    account_sync(a, acc, t)
+    shop = get_store_family_retry(a, acc, t, family_code, enterprise_arg)
+    if api_auth_failed(shop):
+        json_auth_error(shop)
+        return
+    out_json({"ok": True, "number": acc["number"], "subscription_type": acc["subscription_type"],
+              "family_code": family_code, "shop": jval(shop)})
+
+
+def cmd_json_package_detail(option_code, family_code, variant_code, enterprise_arg):
+    if not option_code:
+        out_json({"ok": False, "error": "missing package code"})
+        return
+    a, act, acc = load_active_account()
+    if not acc:
+        return
+    t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+    if refresh_account(acc, t):
+        out_json({"ok": False, "error": "refresh failed", "number": acc["number"]})
+        return
+    account_sync(a, acc, t)
+    detail = get_package_detail_retry_ex(a, acc, t, option_code, family_code or "", variant_code or "", is_true(enterprise_arg))
+    if api_auth_failed(detail):
+        json_auth_error(detail)
+        return
+    o = parse_json(detail)
+    ok = isinstance(o, dict) and o.get("status") == "SUCCESS" and isinstance(o.get("data"), dict) and isinstance(o["data"].get("package_option"), dict)
+    if not ok:
+        out_json({"ok": False, "error": "package detail failed", "action_param": option_code, "response": jval(detail)})
+        return
+    out_json({"ok": True, "action_param": option_code, "detail": jval(detail)})
+
+
+def get_package_detail_retry_ex(a, acc, t, code, family, variant, ent):
+    r = get_package_detail_api_ex(t, code, family, variant, ent, "NONE")
+    if api_auth_failed(r) and not api_retry_auth(acc, a, t):
+        r = get_package_detail_api_ex(t, code, family, variant, ent, "NONE")
+    return r
+
+
+def cmd_json_payment_quote(option_code):
+    if not option_code:
+        out_json({"ok": False, "error": "missing package code"})
+        return
+    a, act, acc, t = json_payment_begin()
+    if not acc:
+        return
+    q = empty_quote()
+    if payment_quote_load(t, option_code, q):
+        out_json({"ok": False, "error": "quote failed"})
+        return
+    out_json({"ok": True, "action_param": option_code, "quote": payment_quote_print_json(q)})
+
+
+def cmd_json_payment_probe(option_code):
+    if not option_code:
+        out_json({"ok": False, "error": "missing package code"})
+        return
+    a, act, acc, t = json_payment_begin()
+    if not acc:
+        return
+    q = empty_quote()
+    if payment_quote_load(t, option_code, q):
+        out_json({"ok": False, "error": "quote failed"})
+        return
+    methods = payment_methods_api(t, q)
+    if api_auth_failed(methods) and not api_retry_auth(acc, a, t):
+        methods = payment_methods_api(t, q)
+    if api_auth_failed(methods):
+        json_auth_error(methods)
+        return
+    ok = api_success_response(methods)
+    out = {"ok": ok, "action_param": option_code, "quote": payment_quote_print_json(q), "payment_methods": jval(methods)}
+    if not ok:
+        out["error"] = "payment methods failed"
+    out_json(out)
+
+
+def payment_config_missing():
+    m = config_missing()
+    if m:
+        return m
+    if not CFG["ENCRYPTED_FIELD_KEY"]:
+        return "ENCRYPTED_FIELD_KEY"
+    return None
+
+
+def cmd_json_payment_pulsa(option_code, confirm_arg, custom_amount):
+    m = payment_config_missing()
+    if m:
+        out_json({"ok": False, "error": "missing env", "missing": m})
+        return
+    if not option_code:
+        out_json({"ok": False, "error": "missing package code"})
+        return
+    a, act, acc, t = json_payment_begin()
+    if not acc:
+        return
+    q = empty_quote()
+    if payment_quote_load(t, option_code, q):
+        out_json({"ok": False, "error": "quote failed"})
+        return
+    amount = payment_amount(q["price"], custom_amount)
+    expect = f"BAYAR-{amount}"
+    if not confirm_arg or confirm_arg != expect:
+        out_json({"ok": False, "error": "confirm required", "confirm": expect,
+                  "quote": payment_quote_print_json(q), "total_amount": amount})
+        return
+    resp = payment_pulsa_settle_many(a, t, [q], 1, amount)
+    o = parse_json(resp)
+    status = jget_s(o, "status")
+    msg = jget_s(o, "message")
+    ok = payment_ok_status(status)
+    out_json({"ok": ok, "payment": "pulsa", "message": msg or status or "unknown",
+              "quote": payment_quote_print_json(q), "total_amount": amount, "response": jval(resp)})
+
+
+def cmd_json_payment_pulsa_cart(n, codes, custom_amount):
+    m = payment_config_missing()
+    if m:
+        out_json({"ok": False, "error": "missing env", "missing": m})
+        return
+    if require_json_payment_confirmed():
+        return
+    if n < 1:
+        out_json({"ok": False, "error": "missing package code"})
+        return
+    if n > 3:
+        out_json({"ok": False, "error": "cart max 3 packages"})
+        return
+    a, act, acc, t = json_payment_begin()
+    if not acc:
+        return
+    total = [0]
+    loaded = [0]
+    q = []
+    if load_payment_quotes_json(a, acc, t, n, codes, q, 3, total, loaded):
+        return
+    amount = payment_amount(total[0], custom_amount)
+    resp = payment_pulsa_settle_many(a, t, q, loaded[0], amount)
+    o = parse_json(resp)
+    status = jget_s(o, "status")
+    msg = jget_s(o, "message")
+    ok = payment_ok_status(status)
+    out_json({"ok": ok, "payment": "pulsa", "message": msg or status or "unknown",
+              "quotes": print_quotes_json(q), "total_amount": amount, "response": jval(resp)})
+
+
+def cmd_json_payment_balance_mode(mode, n, codes, custom_amount):
+    m = payment_config_missing()
+    if m:
+        out_json({"ok": False, "error": "missing env", "missing": m})
+        return
+    if require_json_payment_confirmed():
+        return
+    a, act, acc, t = json_payment_begin()
+    if not acc:
+        return
+    total = [0]
+    loaded = [0]
+    q = []
+    if load_payment_quotes_json(a, acc, t, n, codes, q, 3, total, loaded):
+        return
+    amount = payment_amount(total[0], custom_amount)
+    resp = payment_pulsa_settle_many(a, t, q, loaded[0], amount)
+    o = parse_json(resp)
+    status = jget_s(o, "status")
+    msg = jget_s(o, "message")
+    ok = payment_ok_status(status)
+    out_json({"ok": ok, "payment": "balance", "mode": mode, "message": msg or status or "unknown",
+              "quotes": print_quotes_json(q), "total_amount": amount, "response": jval(resp)})
+
+
+def cmd_json_payment_decoy_mode(mode, standard, n, codes, custom_amount):
+    m = payment_config_missing()
+    if m:
+        out_json({"ok": False, "error": "missing env", "missing": m})
+        return
+    if require_json_payment_confirmed():
+        return
+    a, act, acc, t = json_payment_begin()
+    if not acc:
+        return
+    total = [0]
+    loaded = [0]
+    q = []
+    if load_payment_quotes_json(a, acc, t, n, codes, q, 3, total, loaded):
+        return
+    decoy = empty_quote()
+    err = [None]
+    refreshed = [0]
+    if decoy_quote_resolve(a, acc, t, decoy, [None], err) != 0:
+        out_json({"ok": False, "error": err[0] or "decoy resolve/validation failed before settlement"})
+        return
+    q.append(decoy)
+    total[0] += decoy["price"]
+    loaded[0] += 1
+    amount = [payment_amount(total[0], custom_amount)]
+    token_idx = 0 if standard else loaded[0] - 1
+    payment_for_override = None if standard else DECOY_V2_PAYMENT_FOR
+    resp = payment_pulsa_settle_retry(acc, t, q, loaded[0], amount, token_idx, payment_for_override)
+    o = parse_json(resp)
+    status = jget_s(o, "status")
+    msg = jget_s(o, "message")
+    ok = payment_ok_status(status)
+    out = {"ok": ok, "payment": "balance", "mode": mode,
+           "token_confirmation_idx": token_idx,
+           "payment_for": q[0]["payment_for"] if standard else DECOY_V2_PAYMENT_FOR,
+           "message": msg or status or "unknown",
+           "quotes": print_quotes_json(q), "total_amount": amount[0], "response": jval(resp)}
+    out_json(out)
+
+
+def cmd_json_payment_qris_mode(mode, decoy_kind, n, codes, custom_amount):
+    m = payment_config_missing()
+    if m:
+        out_json({"ok": False, "error": "missing env", "missing": m})
+        return
+    if require_json_payment_confirmed():
+        return
+    a, act, acc, t = json_payment_begin()
+    if not acc:
+        return
+    total = [0]
+    loaded = [0]
+    q = []
+    if load_payment_quotes_json(a, acc, t, n, codes, q, 3, total, loaded):
+        return
+    if decoy_kind:
+        decoy = empty_quote()
+        if decoy_quote_resolve(a, acc, t, decoy, [None], [None]) != 0:
+            out_json({"ok": False, "error": "decoy resolve/validation failed before settlement"})
+            return
+        q.append(decoy)
+        total[0] += decoy["price"]
+        loaded[0] += 1
+    amount = payment_amount(total[0], custom_amount)
+    token_idx = loaded[0] - 1 if decoy_kind else 0
+    payment_for = "SHARE_PACKAGE" if decoy_kind else None
+    resp = payment_qris_settle_many_ex(acc, t, q, loaded[0], amount, token_idx, payment_for)
+    o = parse_json(resp)
+    status = jget_s(o, "status")
+    message = jget_s(o, "message")
+    transaction = jget_s(o, "transaction_code")
+    ok = payment_ok_status(status)
+    out = {"ok": ok, "payment": "qris", "mode": mode, "message": message or status or "unknown",
+           "quotes": print_quotes_json(q), "total_amount": amount, "response": jval(resp)}
+    if ok and transaction:
+        pending = get_transaction_status_retry(a, acc, t, transaction, "")
+        qr = jget_s(parse_json(pending), "qr_code")
+        if transaction:
+            out["transaction_code"] = transaction
+        if pending:
+            out["pending_detail"] = jval(pending)
+        if qr:
+            out["qris_code"] = qr
+            out["qris_url"] = f"http://192.168.1.1/qrcode.php?data={b64_encode(qr.encode(), urlsafe=True)}"
+    out_json(out)
+
+
+def ewallet_method_arg(s):
+    m = (s or "").upper()
+    return m if m in ("DANA", "SHOPEEPAY", "GOPAY") else ""
+
+
+def cmd_json_payment_ewallet_mode(method, n, codes, wallet_arg, custom_amount):
+    m = payment_config_missing()
+    if m:
+        out_json({"ok": False, "error": "missing env", "missing": m})
+        return
+    if require_json_payment_confirmed():
+        return
+    wallet = wallet_api_number(wallet_arg)
+    if method == "DANA" and (not wallet.startswith("08") or not (10 <= len(wallet) <= 13)):
+        out_json({"ok": False, "error": "wallet number must start with 08 and contain 10-13 digits"})
+        return
+    a, act, acc, t = json_payment_begin()
+    if not acc:
+        return
+    total = [0]
+    loaded = [0]
+    q = []
+    if load_payment_quotes_json(a, acc, t, n, codes, q, 3, total, loaded):
+        return
+    amount = payment_amount(total[0], custom_amount)
+    resp = payment_ewallet_settle_many(acc, t, q, loaded[0], amount, method, wallet)
+    o = parse_json(resp)
+    status = jget_s(o, "status")
+    msg = jget_s(o, "message")
+    deeplink = jget_s(o, "deeplink")
+    ok = payment_ok_status(status)
+    out = {"ok": ok, "payment": "ewallet", "method": method, "message": msg or status or "unknown",
+           "quotes": print_quotes_json(q), "total_amount": amount, "response": jval(resp)}
+    if deeplink:
+        out["deeplink"] = deeplink
+    out_json(out)
+
+
+def cmd_json_payment_single_special(mode, n, codes, extra):
+    m = payment_config_missing()
+    if m:
+        out_json({"ok": False, "error": "missing env", "missing": m})
+        return
+    if require_json_payment_confirmed():
+        return
+    if n != 1:
+        out_json({"ok": False, "error": "payment mode supports one package only"})
+        return
+    dest = None
+    if mode == "gift":
+        dest = dest_msisdn(extra)
+        if not msisdn_ok(dest):
+            out_json({"ok": False, "error": "destination msisdn must start with 628"})
+            return
+    a, act, acc, t = json_payment_begin()
+    if not acc:
+        return
+    q = empty_quote()
+    if payment_quote_load(t, codes[0], q):
+        out_json({"ok": False, "error": "quote failed"})
+        return
+    if (q.get("payment_for") or "") != "REDEEM_VOUCHER":
+        out_json({"ok": False, "error": "payment mode requires REDEEM_VOUCHER", "payment": mode,
+                  "payment_for": q["payment_for"], "quote": payment_quote_print_json(q)})
+        return
+    if mode == "point":
+        resp = payment_point_settle(acc, t, q)
+    elif mode == "voucher":
+        resp = payment_voucher_settle(acc, t, q)
+    else:
+        resp = payment_gift_settle(acc, t, q, dest)
+    o = parse_json(resp)
+    status = jget_s(o, "status")
+    msg = jget_s(o, "message")
+    ok = payment_ok_status(status)
+    out_json({"ok": ok, "payment": mode, "message": msg or status or "unknown",
+              "quote": payment_quote_print_json(q), "response": jval(resp)})
+
+
+# ---------------------------------------------------------------------------
+# human commands
+# ---------------------------------------------------------------------------
+def delete_account_number(number):
+    a = accounts_load()
+    token_cache_delete({"number": number})
+    response_cache_invalidate_account({"number": number})
+    a = [it for it in a if it["number"] != number]
+    for it in a:
+        it["dirty"] = True
+    accounts_save(a)
+    act = active_get()
+    if act == number:
+        active_set("")
+
+
+def cmd_login(inp):
+    number = login_msisdn(inp)
+    if not number:
+        die("number must use 08 or 628 format and contain 8-14 normalized digits")
+    resp = request_otp(number)
+    if "subscriber_id" in resp:
+        print(f"OTP requested for {number}. Next: bitsxl otp {number} <code>")
+    else:
+        print(f"OTP response: {resp}")
+
+
+def cmd_otp(inp, code):
+    number = login_msisdn(inp)
+    if not number:
+        die("number must use 08 or 628 format and contain 8-14 normalized digits")
+    if not otp_ok(code):
+        die("otp must be 6 digits")
+    resp = submit_otp("SMS", number, code)
+    t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+    if parse_tokens(resp, t):
+        die(f"login failed: {resp}")
+    profile = get_profile(t)
+    po = parse_json(profile)
+    sub = jget_s(po, "subscriber_id") or ""
+    typ = jget_s(po, "subscription_type") or ""
+    a = accounts_load()
+    accounts_put(a, number, sub, typ, t["refresh_token"])
+    saved = accounts_find(a, number)
+    if saved:
+        token_cache_save(saved, t)
+    accounts_save(a)
+    active_set(number)
+    print(f"saved {number} [{typ or 'unknown'}]")
+
+
+def cmd_accounts():
+    a = accounts_load()
+    act = active_get()
+    if not a:
+        print("no accounts")
+    for it in a:
+        star = "*" if act == it["number"] else " "
+        print(f"{star} {it['number']} [{it['subscription_type']}]")
+
+
+def cmd_use(number):
+    a = accounts_load()
+    if not accounts_find(a, number):
+        die(f"account not found: {number}")
+    active_set(number)
+    print(f"active: {number}")
+
+
+def cmd_del(number):
+    delete_account_number(number)
+    print(f"deleted: {number}")
+
+
+def cmd_logout():
+    act = active_get()
+    a = accounts_load()
+    acc = accounts_find(a, act) if act else None
+    if acc:
+        token_cache_delete(acc)
+        response_cache_invalidate_account(acc)
+    active_set("")
+    print(f"session reset{':' if act else ''}{act}")
+
+
+def cmd_env():
+    print(f"home: {CFG['home']}")
+    print(f"env: {CFG['env_path'] or '(none)'}")
+    for k in CONFIG_REQUIRED:
+        state = "ok" if CFG[k] else "missing"
+        print(f"{k}: {state}")
+    for k in ("DECOY_PREPAID_FAMILY_CODE", "DECOY_PREPAID_PACKAGE_NUMBER", "DECOY_PRIORITAS_FAMILY_CODE",
+              "DECOY_PRIORITAS_PACKAGE_NUMBER", "DECOY_PRIOHYBRID_FAMILY_CODE", "DECOY_PRIOHYBRID_PACKAGE_NUMBER"):
+        if k.endswith("FAMILY_CODE"):
+            state = "set" if CFG[k] else ("fallback PRIORITAS" if k.startswith("DECOY_PRIOHYBRID") else "default")
+        else:
+            v = decoy_package_number_parse(CFG[k])
+            state = "set" if v is not None else ("invalid" if CFG[k] else ("fallback PRIORITAS" if k.startswith("DECOY_PRIOHYBRID") else "default"))
+        print(f"{k}: {state}")
+    print("libmbedcrypto: linked")
+
+
+def show_quota_pretty(j, number, subtype):
+    o = parse_json(j)
+    quotas = (o.get("quotas") if isinstance(o, dict) else None) or []
+    print("=" * 55)
+    print(f"             MyXL Quota - {number}")
+    print(f"                    {subtype or ''}")
+    print("=" * 55)
+    for idx, obj in enumerate(quotas, 1):
+        name = obj.get("name") if isinstance(obj, dict) else None
+        code = obj.get("quota_code")
+        domain = obj.get("product_domain")
+        pst = obj.get("product_subscription_type")
+        print(f"\n[{idx}] {name or '(no name)'}  (code: {code}) (domain: {domain}) (type: {pst})")
+    print("=" * 55)
+    return quotas
+
+
+def cmd_quota(number_arg):
+    a = accounts_load()
+    number = number_arg
+    if not number:
+        number = active_get()
+    if not number:
+        die("no active account. run: bitsxl use <number>")
+    acc = accounts_find(a, number)
+    if not acc:
+        die(f"account not found: {number}")
+    t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+    if refresh_account(acc, t):
+        sys.exit(1)
+    account_sync(a, acc, t)
+    q = get_quota(t)
+    show_quota_pretty(q, acc["number"], acc["subscription_type"])
+
+
+def cli_begin():
+    a = accounts_load()
+    act = active_get()
+    acc = accounts_find(a, act) if act else None
+    if not acc:
+        sys.stderr.write("no active account. run: bitsxl use <number>\n")
+        return None, None, None, None
+    t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+    if refresh_account(acc, t):
+        sys.stderr.write(f"refresh failed: {acc['number']}\n")
+        return None, None, None, None
+    account_sync(a, acc, t)
+    return a, act, acc, t
+
+
+def cmd_shop(enterprise_arg):
+    a, act, acc, t = cli_begin()
+    if not acc:
+        sys.exit(1)
+    shop = get_store_packages_retry(a, acc, t, is_true(enterprise_arg))
+    print(shop)
+
+
+def cmd_segments(enterprise_arg):
+    a, act, acc, t = cli_begin()
+    if not acc:
+        sys.exit(1)
+    segments = get_store_segments_retry(a, acc, t, is_true(enterprise_arg))
+    print(segments)
+
+
+def cmd_pay_quote(option_code):
+    a, act, acc, t = cli_begin()
+    if not acc:
+        sys.exit(1)
+    q = empty_quote()
+    if payment_quote_load(t, option_code, q) != 0:
+        return
+    # pretty-print quote
+    print(f"Paket: {q['item_name']}")
+    print(f"Family: {q['family']}")
+    print(f"Harga: Rp {money_id(q['price'])}")
+
+
+def cmd_pay_pulsa(option_code, confirm, custom_amount):
+    m = payment_config_missing()
+    if m:
+        die(f"missing env {m}")
+    a, act, acc, t = cli_begin()
+    if not acc:
+        sys.exit(1)
+    q = empty_quote()
+    if payment_quote_load(t, option_code, q):
+        return
+    amount = payment_amount(q["price"], custom_amount)
+    expect = f"BAYAR-{amount}"
+    if not confirm or confirm != expect:
+        die(f"confirm required: bitsxl pay-pulsa {option_code} {expect}")
+    resp = payment_pulsa_settle_many(acc, t, [q], 1, amount)
+    print(resp)
+
+
+def cmd_pay_human(mode, n, codes):
+    m = payment_config_missing()
+    if m:
+        die(f"missing env {m}")
+    if n < 1:
+        die("missing package code")
+    a, act, acc, t = cli_begin()
+    if not acc:
+        sys.exit(1)
+    q = []
+    total = 0
+    for code in codes:
+        qq = empty_quote()
+        if payment_quote_load(t, code, qq):
+            sys.stderr.write(f"quote failed {code}\n")
+            sys.exit(1)
+        total += qq["price"]
+        q.append(qq)
+    amount = payment_amount(total, -1)
+    if mode == "balance":
+        resp = payment_pulsa_settle_many(acc, t, q, len(q), amount)
+    elif mode == "decoy-standard":
+        decoy = empty_quote()
+        if decoy_quote_resolve(a, acc, t, decoy, [None], [None]) != 0:
+            die("decoy resolve failed")
+        q.append(decoy)
+        amount += decoy["price"]
+        resp = payment_pulsa_settle_many_raw(acc, t, q, len(q), amount, 0, None)
+    elif mode == "decoy-v2":
+        decoy = empty_quote()
+        if decoy_quote_resolve(a, acc, t, decoy, [None], [None]) != 0:
+            die("decoy resolve failed")
+        q.append(decoy)
+        amount += decoy["price"]
+        resp = payment_pulsa_settle_many_raw(acc, t, q, len(q), amount, len(q) - 1, DECOY_V2_PAYMENT_FOR)
+    elif mode == "qris":
+        resp = payment_qris_settle_many_ex(acc, t, q, len(q), amount, 0, None)
+    else:
+        die("mode not supported human")
+    o = parse_json(resp)
+    status = jget_s(o, "status")
+    msg = jget_s(o, "message")
+    print(f"Result: {status or 'UNKNOWN'}{' - ' if msg else ''}{msg or ''}")
+
+
+def cmd_transaction_history_human():
+    a, act, acc, t = cli_begin()
+    if not acc:
+        sys.exit(1)
+    print(get_transaction_history_retry(a, acc, t))
+
+
+def cmd_pending_transactions_human():
+    a, act, acc, t = cli_begin()
+    if not acc:
+        sys.exit(1)
+    print(get_pending_transactions_retry(a, acc, t))
+
+
+def cmd_transaction_status_human(tx, status_arg):
+    if not tx:
+        die("missing transaction id")
+    a, act, acc, t = cli_begin()
+    if not acc:
+        sys.exit(1)
+    print(get_transaction_status_retry(a, acc, t, tx, status_arg or ""))
+
+
+# ---------------------------------------------------------------------------
+# interactive menu (simplified but functional)
+# ---------------------------------------------------------------------------
+def prompt_line(label):
+    try:
+        return input(label).strip()
+    except EOFError:
+        return ""
+
+
+def pause_enter():
+    try:
+        input("Tekan Enter untuk lanjut...")
+    except EOFError:
+        pass
+
+
+def interactive_main_menu():
+    while True:
+        a = accounts_load()
+        act = active_get()
+        acc = accounts_find(a, act) if act else None
+        print("\033[H\033[J", end="")
+        print("=" * 55)
+        if acc:
+            print(f"Nomor: {acc['number']} | Type: {acc['subscription_type']}")
+        else:
+            print("Belum ada akun aktif")
+        print("=" * 55)
+        print("Menu:\n1. Login/Ganti akun\n2. Lihat Paket Saya\n3. Store Segments\n4. Store Packages\n5. Beli Paket Berdasarkan Family Code\n6. Point / Redeemables\n7. Beli Semua Paket dalam Family Code\n0. Kuota\n99. Tutup aplikasi")
+        choice = prompt_line("Pilih menu: ")
+        if choice == "99":
+            return
+        if choice == "1":
+            interactive_account_menu()
+        elif choice == "2" or choice == "0":
+            if not acc:
+                print("No active user. Pilih/login akun dulu.")
+                pause_enter()
+            else:
+                interactive_quota(acc["number"])
+        elif choice == "3":
+            cmd_segments("")
+        elif choice == "4":
+            cmd_shop("")
+        elif choice == "6":
+            interactive_redeemables("")
+        else:
+            print("Pilihan tidak valid.")
+            pause_enter()
+
+
+def interactive_login_prompt():
+    print("-" * 55)
+    print("Login ke MyXL")
+    inp = prompt_line("Nomor XL (08xxxx / 628xxxx): ")
+    number = login_msisdn(inp)
+    if not number:
+        print("Nomor tidak valid.")
+        pause_enter()
+        return
+    otp_res = request_otp(number)
+    if "subscriber_id" not in otp_res:
+        print(f"Gagal request OTP:\n{otp_res}")
+        pause_enter()
+        return
+    print("OTP berhasil dikirim.")
+    for tries in (3, 2, 1):
+        otp = prompt_line("Masukkan OTP: ")
+        if not otp_ok(otp):
+            print("OTP tidak valid. Harus 6 digit angka.")
+            continue
+        resp = submit_otp("SMS", number, otp)
+        t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+        if parse_tokens(resp, t):
+            print(f"OTP salah/gagal:\n{resp}")
+            continue
+        profile = get_profile(t)
+        po = parse_json(profile)
+        sub = jget_s(po, "subscriber_id") or ""
+        typ = jget_s(po, "subscription_type") or ""
+        a = accounts_load()
+        accounts_put(a, number, sub, typ, t["refresh_token"])
+        saved = accounts_find(a, number)
+        if saved:
+            token_cache_save(saved, t)
+        accounts_save(a)
+        active_set(number)
+        print(f"Berhasil login: {number} [{typ or 'unknown'}]")
+        pause_enter()
+        return
+    print("Gagal login setelah beberapa percobaan.")
+    pause_enter()
+
+
+def interactive_account_menu():
+    while True:
+        a = accounts_load()
+        act = active_get()
+        print("\033[H\033[J", end="")
+        print("-" * 55)
+        print("Akun Tersimpan:")
+        if not a:
+            print("Tidak ada akun tersimpan.")
+        for i, it in enumerate(a, 1):
+            marker = "(Aktif)" if act == it["number"] else ""
+            print(f"{i}. {it['number']} [{it['subscription_type']}] {marker}")
+        print("-" * 55)
+        choice = prompt_line("Pilihan: ")
+        if choice == "00":
+            return
+        if choice == "0":
+            interactive_login_prompt()
+            continue
+        if choice.startswith("del "):
+            try:
+                idx = int(choice[4:])
+            except ValueError:
+                print("Nomor urut tidak valid.")
+                pause_enter()
+                continue
+            if idx < 1 or idx > len(a):
+                print("Nomor urut tidak valid.")
+            elif act == a[idx - 1]["number"]:
+                print("Tidak dapat menghapus akun aktif.")
+            else:
+                delete_account_number(a[idx - 1]["number"])
+                print("Akun berhasil dihapus.")
+            pause_enter()
+            continue
+        if choice.isdigit():
+            idx = int(choice)
+            if 1 <= idx <= len(a):
+                active_set(a[idx - 1]["number"])
+                print(f"Akun aktif: {a[idx - 1]['number']}")
+                pause_enter()
+                return
+        print("Input tidak valid.")
+        pause_enter()
+
+
+def interactive_quota(number):
+    while True:
+        acc = accounts_find(accounts_load(), number)
+        if not acc:
+            print(f"Akun tidak ditemukan: {number}")
+            pause_enter()
+            return
+        t = {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}
+        if refresh_account(acc, t):
+            print("Gagal refresh token.")
+            pause_enter()
+            return
+        q = get_quota(t)
+        show_quota_pretty(q, acc["number"], acc["subscription_type"])
+        choice = prompt_line("Pilihan (00/Enter kembali): ")
+        if choice in ("", "00"):
+            return
+
+
+def interactive_redeemables(enterprise_arg):
+    a, act, acc = cli_begin()
+    if not acc:
+        pause_enter()
+        return
+    res = get_redeemables_retry(a, acc, {"access_token": None, "id_token": None, "refresh_token": None, "cached": False}, is_true(enterprise_arg))
+    print(res)
+    pause_enter()
+
+
+def usage():
+    print("bitsxl                 # menu interaktif")
+    print("bitsxl json dashboard|status|accounts|quota|segments|tiering|history|pending|notifications|point|redeemables|shop|family-list|env|settings|login|otp|use|del|logout|reset-session|unsub|payment ...")
+    print("bitsxl login <08...|628...>")
+    print("bitsxl otp <08...|628...> <code>")
+    print("bitsxl accounts")
+    print("bitsxl use <628...>")
+    print("bitsxl del <628...>")
+    print("bitsxl logout")
+    print("bitsxl quota [628...]")
+    print("bitsxl env")
+    print("bitsxl pay-quote <package_code>")
+    print("bitsxl pay-pulsa <package_code> [--amount rupiah] BAYAR-<harga>")
+
+
+# ---------------------------------------------------------------------------
+# json dispatch
+# ---------------------------------------------------------------------------
+def cmd_json(argv):
+    if not argv:
+        out_json({"ok": False, "error": "missing json command"})
+        return 0
+    c0 = argv[0]
+    if c0 in ("dashboard", "status"):
+        if json_require_config():
+            return 1
+        cmd_json_dashboard()
+    elif c0 == "accounts":
+        cmd_json_accounts()
+    elif c0 in ("env", "settings"):
+        cmd_json_env()
+    elif c0 == "quota":
+        if json_require_config():
+            return 1
+        cmd_json_quota(argv[1] if len(argv) >= 2 else None, len(argv) >= 3 and argv[2] == "fresh")
+    elif c0 == "tiering":
+        if json_require_config():
+            return 1
+        cmd_json_tiering()
+    elif c0 in ("transaction-history", "history"):
+        if json_require_config():
+            return 1
+        cmd_json_transaction_history()
+    elif c0 in ("pending", "pending-transactions"):
+        if json_require_config():
+            return 1
+        cmd_json_pending_transactions()
+    elif c0 in ("transaction-status", "status-transaction", "payment-status"):
+        if json_require_config():
+            return 1
+        cmd_json_transaction_status(argv[1] if len(argv) >= 2 else None, argv[2] if len(argv) >= 3 else "")
+    elif c0 in ("notifications", "notification"):
+        if json_require_config():
+            return 1
+        cmd_json_notifications()
+    elif c0 in ("notification-detail", "notification-read", "notification-read-all"):
+        if json_require_config():
+            return 1
+        cmd_json_notification_read(argv[1:])
+    elif c0 in ("point", "redeemables"):
+        if json_require_config():
+            return 1
+        cmd_json_redeemables(argv[1] if len(argv) >= 2 else "")
+    elif c0 in ("segments", "store-segments"):
+        if json_require_config():
+            return 1
+        cmd_json_store_segments(argv[1] if len(argv) >= 2 else "")
+    elif c0 in ("shop", "store-packages"):
+        if json_require_config():
+            return 1
+        if len(argv) >= 3 and argv[1] == "family":
+            cmd_json_shop_family(argv[2], argv[3] if len(argv) >= 4 else "")
+        elif len(argv) >= 2 and argv[1] == "family-list":
+            cmd_json_shop_family_list(argv[2] if len(argv) >= 3 else "")
+        else:
+            cmd_json_shop(argv[1] if len(argv) >= 2 else "")
+    elif c0 == "family-list":
+        if json_require_config():
+            return 1
+        cmd_json_shop_family_list(argv[1] if len(argv) >= 2 else "")
+    elif c0 == "family":
+        if json_require_config():
+            return 1
+        cmd_json_shop_family(argv[1] if len(argv) >= 2 else None, argv[2] if len(argv) >= 3 else "")
+    elif c0 in ("package", "detail") and len(argv) >= 2:
+        if json_require_config():
+            return 1
+        if c0 == "package" and argv[1] == "detail":
+            cmd_json_package_detail(argv[2] if len(argv) >= 3 else None, argv[3] if len(argv) >= 4 else "",
+                                     argv[4] if len(argv) >= 5 else "", argv[5] if len(argv) >= 6 else "")
+        else:
+            cmd_json_package_detail(argv[1], argv[2] if len(argv) >= 3 else "", argv[3] if len(argv) >= 4 else "", argv[4] if len(argv) >= 5 else "")
+    elif c0 == "payment" and len(argv) >= 2:
+        if json_require_config():
+            return 1
+        pay_argv = argv[2:]
+        pay_argv, confirmed = strip_json_confirm_args(pay_argv)
+        if pay_argv is None:
+            out_json({"ok": False, "error": "invalid confirm"})
+            return 1
+        global json_payment_confirmed
+        json_payment_confirmed = confirmed
+        pay_argv, custom = strip_custom_amount_args(pay_argv)
+        if pay_argv is None:
+            out_json({"ok": False, "error": "invalid custom amount"})
+            return 1
+        custom = -1 if custom is None else custom
+        p1 = argv[1]
+        if p1 == "quote":
+            if not pay_argv:
+                out_json({"ok": False, "error": "missing package code"})
+            else:
+                cmd_json_payment_quote(pay_argv[0])
+        elif p1 == "probe":
+            if not pay_argv:
+                out_json({"ok": False, "error": "missing package code"})
+            else:
+                cmd_json_payment_probe(pay_argv[0])
+        elif p1 == "pulsa":
+            if not pay_argv:
+                out_json({"ok": False, "error": "missing package code"})
+            else:
+                cmd_json_payment_pulsa(pay_argv[0], pay_argv[1] if len(pay_argv) >= 2 else None, custom)
+        elif p1 == "cart":
+            cmd_json_payment_pulsa_cart(len(pay_argv), pay_argv, custom)
+        elif p1 in ("auto", "balance"):
+            cmd_json_payment_balance_mode(p1, len(pay_argv), pay_argv, custom)
+        elif p1 in ("balance-decoy-standard", "decoy-standard"):
+            cmd_json_payment_decoy_mode("balance-decoy-standard", True, len(pay_argv), pay_argv, custom)
+        elif p1 in ("balance-decoy-v2", "decoy-v2", "balance-decoy", "decoy", "prio"):
+            cmd_json_payment_decoy_mode("balance-decoy-v2", False, len(pay_argv), pay_argv, custom)
+        elif p1 == "qris":
+            cmd_json_payment_qris_mode("qris", None, len(pay_argv), pay_argv, custom)
+        elif p1 == "dana":
+            if len(pay_argv) < 2:
+                out_json({"ok": False, "error": "missing wallet/package"})
+            else:
+                cmd_json_payment_ewallet_mode("DANA", len(pay_argv) - 1, pay_argv, pay_argv[-1], custom)
+        elif p1 == "shopeepay":
+            cmd_json_payment_ewallet_mode("SHOPEEPAY", len(pay_argv), pay_argv, "", custom)
+        elif p1 == "gopay":
+            cmd_json_payment_ewallet_mode("GOPAY", len(pay_argv), pay_argv, "", custom)
+        elif p1 == "ewallet":
+            m = ewallet_method_arg(pay_argv[0]) if pay_argv else ""
+            if len(pay_argv) < 3:
+                out_json({"ok": False, "error": "usage: payment ewallet METHOD wallet_or_dash code..."})
+            elif not m:
+                out_json({"ok": False, "error": "unsupported ewallet"})
+            else:
+                wallet = "" if pay_argv[1] == "-" else pay_argv[1]
+                cmd_json_payment_ewallet_mode(m, len(pay_argv) - 2, pay_argv[2:], wallet, custom)
+        elif p1 == "point":
+            if custom >= 0:
+                out_json({"ok": False, "error": "custom amount not supported for point"})
+            else:
+                cmd_json_payment_single_special("point", len(pay_argv), pay_argv, None)
+        elif p1 == "voucher":
+            if custom >= 0:
+                out_json({"ok": False, "error": "custom amount not supported for voucher"})
+            else:
+                cmd_json_payment_single_special("voucher", len(pay_argv), pay_argv, None)
+        elif p1 == "gift":
+            if custom >= 0:
+                out_json({"ok": False, "error": "custom amount not supported for gift"})
+            elif len(pay_argv) < 2:
+                out_json({"ok": False, "error": "missing destination/package"})
+            else:
+                cmd_json_payment_single_special("gift", len(pay_argv) - 1, pay_argv, pay_argv[-1])
+        elif p1 in ("status", "pending-detail"):
+            cmd_json_transaction_status(pay_argv[0] if pay_argv else None, pay_argv[1] if len(pay_argv) >= 2 else "")
+        elif p1 in ("history", "transaction-history"):
+            cmd_json_transaction_history()
+        else:
+            out_json({"ok": False, "error": "unknown payment command"})
+    elif c0 == "pay-quote" and len(argv) >= 2:
+        if json_require_config():
+            return 1
+        cmd_json_payment_quote(argv[1])
+    elif c0 == "pay-pulsa" and len(argv) >= 2:
+        if json_require_config():
+            return 1
+        pay_argv = argv[1:]
+        pay_argv, custom = strip_custom_amount_args(pay_argv)
+        if pay_argv is None:
+            out_json({"ok": False, "error": "invalid custom amount"})
+            return 1
+        if not pay_argv:
+            out_json({"ok": False, "error": "missing package code"})
+        else:
+            cmd_json_payment_pulsa(pay_argv[0], pay_argv[1] if len(pay_argv) >= 2 else None, -1 if custom is None else custom)
+    elif c0 == "use" and len(argv) >= 2:
+        cmd_json_use(argv[1])
+    elif c0 == "del" and len(argv) >= 2:
+        cmd_json_del(argv[1])
+    elif c0 in ("logout", "reset-session"):
+        cmd_json_logout()
+    elif c0 in ("unsub", "unsubscribe") and len(argv) >= 2:
+        if json_require_config():
+            return 1
+        cmd_json_unsub(argv[1], argv[2] if len(argv) >= 3 else "", argv[3] if len(argv) >= 4 else "")
+    elif c0 == "login" and len(argv) >= 2:
+        if json_require_config():
+            return 1
+        cmd_json_login(argv[1])
+    elif c0 == "otp" and len(argv) >= 3:
+        if json_require_config():
+            return 1
+        cmd_json_otp(argv[1], argv[2])
+    else:
+        out_json({"ok": False, "error": "unknown json command"})
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+def main(argv):
+    load_config()
+    if len(argv) < 2:
+        require_config()
+        interactive_main_menu()
+        return 0
+    c1 = argv[1]
+    if c1 in ("--version", "-V", "version"):
+        print(VERSION)
+        return 0
+    if c1 in ("--help", "-h", "help"):
+        usage()
+        return 0
+    if c1 == "login" and len(argv) == 3:
+        require_config()
+        cmd_login(argv[2])
+    elif c1 == "otp" and len(argv) == 4:
+        require_config()
+        cmd_otp(argv[2], argv[3])
+    elif c1 == "accounts":
+        cmd_accounts()
+    elif c1 == "accounts-json":
+        cmd_json_accounts()
+    elif c1 == "use" and len(argv) == 3:
+        cmd_use(argv[2])
+    elif c1 == "del" and len(argv) == 3:
+        cmd_del(argv[2])
+    elif c1 in ("logout", "reset-session"):
+        cmd_logout()
+    elif c1 == "quota":
+        require_config()
+        cmd_quota(argv[2] if len(argv) >= 3 else None)
+    elif c1 == "quota-json":
+        if json_require_config():
+            return 1
+        cmd_json_quota(argv[2] if len(argv) >= 3 else None, len(argv) >= 4 and argv[3] == "fresh")
+    elif c1 in ("segments", "store-segments"):
+        require_config()
+        cmd_segments(argv[2] if len(argv) >= 3 else "")
+    elif c1 in ("point", "redeemables"):
+        require_config()
+        interactive_redeemables(argv[2] if len(argv) >= 3 else "")
+    elif c1 in ("shop", "store-packages"):
+        require_config()
+        cmd_shop(argv[2] if len(argv) >= 3 else "")
+    elif c1 in ("history", "transaction-history"):
+        require_config()
+        cmd_transaction_history_human()
+    elif c1 in ("pending", "pending-transactions"):
+        require_config()
+        cmd_pending_transactions_human()
+    elif c1 in ("transaction-status", "status-transaction", "payment-status"):
+        require_config()
+        cmd_transaction_status_human(argv[2] if len(argv) >= 3 else None, argv[3] if len(argv) >= 4 else "")
+    elif c1 == "pay-quote" and len(argv) >= 3:
+        require_config()
+        cmd_pay_quote(argv[2])
+    elif c1 == "pay-pulsa" and len(argv) >= 3:
+        require_config()
+        a = argv[2:]
+        a, custom = strip_custom_amount_args(a)
+        if a is None:
+            die("invalid custom amount")
+        if not a:
+            die("missing package code")
+        cmd_pay_pulsa(a[0], a[1] if len(a) >= 2 else None, -1 if custom is None else custom)
+    elif c1 in ("pay-balance", "pay-auto"):
+        require_config()
+        a = argv[2:]
+        a, _ = strip_custom_amount_args(a)
+        cmd_pay_human("balance", len(a), a)
+    elif c1 in ("pay-balance-decoy-standard", "pay-decoy-standard"):
+        require_config()
+        a = argv[2:]
+        a, _ = strip_custom_amount_args(a)
+        cmd_pay_human("decoy-standard", len(a), a)
+    elif c1 in ("pay-balance-decoy-v2", "pay-decoy-v2", "pay-decoy", "pay-balance-decoy"):
+        require_config()
+        a = argv[2:]
+        a, _ = strip_custom_amount_args(a)
+        cmd_pay_human("decoy-v2", len(a), a)
+    elif c1 == "pay-qris":
+        require_config()
+        a = argv[2:]
+        a, _ = strip_custom_amount_args(a)
+        cmd_pay_human("qris", len(a), a)
+    elif c1 == "pay-ewallet":
+        require_config()
+        a = argv[2:]
+        print("ewallet human not implemented; use json payment ewallet")
+    elif c1 in ("pay-point", "pay-voucher", "pay-gift"):
+        require_config()
+        print("special payment human not implemented; use json payment")
+    elif c1 == "status-json" or c1 == "dashboard-json":
+        if json_require_config():
+            return 1
+        cmd_json_dashboard()
+    elif c1 == "env":
+        cmd_env()
+    elif c1 in ("env-json", "settings-json"):
+        cmd_json_env()
+    elif c1 == "json":
+        return cmd_json(argv[2:])
+    else:
+        usage()
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

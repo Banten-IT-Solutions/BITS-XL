@@ -8,7 +8,7 @@
       "prepareCmd": "node scripts/prepare.js ${nextRelease.version}"
     }],
     ["@semantic-release/git", {
-      "assets": ["package.json", "package-lock.json", "luci-app-bitsxl/control", "CHANGELOG.md"],
+      "assets": ["package.json", "package-lock.json", "bitsxl/control", "luci-app-bitsxl/control", "CHANGELOG.md"],
       "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
     }],
     ["@semantic-release/github", {

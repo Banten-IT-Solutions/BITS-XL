@@ -10,7 +10,7 @@ if (!version) {
   process.exit(1);
 }
 
-const packages = ['luci-app-bitsxl'];
+const packages = ['bitsxl', 'luci-app-bitsxl'];
 
 // 1) bump package.json + package-lock.json (manual, toleran same-version)
 const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));

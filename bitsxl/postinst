@@ -1,0 +1,14 @@
+#!/bin/sh
+# postinst bitsxl
+# Bersihkan cache + best-effort pasang pycryptodome (non-fatal, latar-belakang).
+
+[ -z "$IPKG_INSTROOT" ] && {
+	rm -rf /tmp/luci-indexcache /tmp/luci-modulecache /tmp/.uci
+
+	# AES-CBC (xdata/fingerprint) tidak ada di stdlib; pasang pycryptodome via pip.
+	if ! python3 -c "import Crypto" >/dev/null 2>&1 && command -v pip3 >/dev/null 2>&1; then
+		( pip3 install --no-cache-dir pycryptodome >/tmp/bitsxl-pip.log 2>&1 & )
+	fi
+}
+
+exit 0

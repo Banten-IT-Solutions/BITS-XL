@@ -1,0 +1,11 @@
+Package: bitsxl
+Version: 1.1.1
+Depends: libc, python3-light, python3-urllib, python3-json, python3-hashlib, python3-ssl, ca-certificates
+Section: utils
+Architecture: all
+Maintainer: Banten IT Solutions <support@bits.co.id>
+License: MIT
+Description: BITS XL (myXL) CLI backend
+  Account, quota, store, checkout, notifications, and transaction status
+  for XL (myXL) — implemented in Python 3, with AES handled by pycryptodome
+  (installed best-effort via pip in postinst).
