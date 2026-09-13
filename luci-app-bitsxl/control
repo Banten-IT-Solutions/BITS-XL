@@ -1,5 +1,5 @@
 Package: luci-app-bitsxl
-Version: 1.2.3
+Version: 1.2.4
 Depends: libc, luci-base, rpcd, bitsxl
 Section: luci
 Architecture: all

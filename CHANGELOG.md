@@ -1,3 +1,10 @@
+## [1.2.4](https://github.com/Banten-IT-Solutions/BITS-XL/compare/v1.2.3...v1.2.4) (2026-09-13)
+
+
+### Bug Fixes
+
+* insert page title before #tabmenu via parentNode (DOM nesting) ([ffda56a](https://github.com/Banten-IT-Solutions/BITS-XL/commit/ffda56ac7289f61a0ff0dbe6cc56f63b4706d77d)), closes [#tabmenu](https://github.com/Banten-IT-Solutions/BITS-XL/issues/tabmenu)
+
 ## [1.2.3](https://github.com/Banten-IT-Solutions/BITS-XL/compare/v1.2.2...v1.2.3) (2026-09-13)
 
 
