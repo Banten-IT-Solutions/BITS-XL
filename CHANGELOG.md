@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/Banten-IT-Solutions/BITS-XL/compare/v1.0.0...v1.1.0) (2026-09-13)
+
+
+### Features
+
+* ship native bitsxl backend package ([8e7fed1](https://github.com/Banten-IT-Solutions/BITS-XL/commit/8e7fed1ed163074d195640b2185a634d4d37db0b))
+
 # 1.0.0 (2026-09-13)
 
 
