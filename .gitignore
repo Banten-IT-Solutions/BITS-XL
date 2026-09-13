@@ -1,0 +1,7 @@
+.build/
+dist/
+*.ipk
+*.apk
+node_modules/
+*.o
+/bitsxl

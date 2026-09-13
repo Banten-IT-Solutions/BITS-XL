@@ -1,0 +1,10 @@
+#!/bin/sh
+# postinst luci-app-bitsxl
+# Reload LuCI ACL/menu setelah instalasi atau upgrade.
+
+[ -z "$IPKG_INSTROOT" ] && {
+	/etc/init.d/rpcd restart >/dev/null 2>&1
+	rm -rf /tmp/luci-indexcache /tmp/luci-modulecache /tmp/luci-* /tmp/.uci
+}
+
+exit 0

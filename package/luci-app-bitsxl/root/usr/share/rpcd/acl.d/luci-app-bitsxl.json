@@ -1,0 +1,41 @@
+{
+	"luci-app-bitsxl": {
+		"description": "Grant access to BITS XL LuCI app",
+		"read": {
+			"cgi-io": [
+				"exec"
+			],
+			"file": {
+				"/usr/bin/bitsxl": [
+					"exec"
+				]
+			},
+			"ubus": {
+				"file": [
+					"exec"
+				]
+			},
+			"uci": [
+				"bitsxl"
+			]
+		},
+		"write": {
+			"cgi-io": [
+				"exec"
+			],
+			"file": {
+				"/usr/bin/bitsxl": [
+					"exec"
+				]
+			},
+			"ubus": {
+				"file": [
+					"exec"
+				]
+			},
+			"uci": [
+				"bitsxl"
+			]
+		}
+	}
+}

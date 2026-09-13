@@ -1,0 +1,8 @@
+Package: luci-app-bitsxl
+Version: 1.0.0
+Depends: libc, luci-base, rpcd, bitsxl
+Section: luci
+Architecture: all
+Maintainer: Banten IT Solutions <support@bits.co.id>
+License: MIT
+Description: LuCI support for BITS XL

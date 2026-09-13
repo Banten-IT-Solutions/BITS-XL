@@ -1,0 +1,98 @@
+{
+	"admin/services/bitsxl": {
+		"title": "BITS XL",
+		"order": 95,
+		"action": { "type": "firstchild", "preferred": "dashboard" },
+		"depends": { "acl": [ "luci-app-bitsxl" ] }
+	},
+	"admin/services/bitsxl/dashboard": {
+		"title": "Dashboard",
+		"order": 1,
+		"action": { "type": "view", "path": "bitsxl/dashboard-segments" },
+		"depends": { "acl": [ "luci-app-bitsxl" ] }
+	},
+	"admin/services/bitsxl/store": {
+		"title": "Store",
+		"order": 2,
+		"action": { "type": "firstchild", "preferred": "main" },
+		"depends": { "acl": [ "luci-app-bitsxl" ] }
+	},
+	"admin/services/bitsxl/store/main": {
+		"title": "Main",
+		"order": 1,
+		"action": { "type": "view", "path": "bitsxl/store" },
+		"depends": { "acl": [ "luci-app-bitsxl" ] }
+	},
+	"admin/services/bitsxl/store/point": {
+		"title": "Point",
+		"order": 2,
+		"action": { "type": "view", "path": "bitsxl/store" },
+		"depends": { "acl": [ "luci-app-bitsxl" ] }
+	},
+	"admin/services/bitsxl/store/custom": {
+		"title": "Custom",
+		"order": 3,
+		"action": { "type": "firstchild", "preferred": "overview" },
+		"depends": { "acl": [ "luci-app-bitsxl" ] }
+	},
+	"admin/services/bitsxl/store/custom/overview": {
+		"title": "Overview",
+		"order": 1,
+		"action": { "type": "view", "path": "bitsxl/store" },
+		"depends": { "acl": [ "luci-app-bitsxl" ] }
+	},
+	"admin/services/bitsxl/store/custom/history": {
+		"title": "History",
+		"order": 2,
+		"action": { "type": "view", "path": "bitsxl/store" },
+		"depends": { "acl": [ "luci-app-bitsxl" ] }
+	},
+	"admin/services/bitsxl/store/custom/family-list": {
+		"title": "Family List",
+		"order": 3,
+		"action": { "type": "view", "path": "bitsxl/store" },
+		"depends": { "acl": [ "luci-app-bitsxl" ] }
+	},
+	"admin/services/bitsxl/store/bookmark": {
+		"title": "Bookmark",
+		"order": 4,
+		"action": { "type": "view", "path": "bitsxl/store" },
+		"depends": { "acl": [ "luci-app-bitsxl" ] }
+	},
+	"admin/services/bitsxl/riwayat": {
+		"title": "Riwayat",
+		"order": 3,
+		"action": { "type": "firstchild", "preferred": "transaction-history" },
+		"depends": { "acl": [ "luci-app-bitsxl" ] }
+	},
+	"admin/services/bitsxl/riwayat/transaction-history": {
+		"title": "Transaction History",
+		"order": 1,
+		"action": { "type": "view", "path": "bitsxl/riwayat-logs" },
+		"depends": { "acl": [ "luci-app-bitsxl" ] }
+	},
+	"admin/services/bitsxl/riwayat/quota-history": {
+		"title": "Kuota History",
+		"order": 2,
+		"action": { "type": "view", "path": "bitsxl/riwayat-logs" },
+		"depends": { "acl": [ "luci-app-bitsxl" ] }
+	},
+	"admin/services/bitsxl/riwayat/logs": {
+		"title": "Logs",
+		"order": 3,
+		"action": { "type": "view", "path": "bitsxl/riwayat-logs" },
+		"depends": { "acl": [ "luci-app-bitsxl" ] }
+	},
+	"admin/services/bitsxl/notifikasi": {
+		"title": "Notifikasi",
+		"order": 4,
+		"action": { "type": "view", "path": "bitsxl/notifikasi" },
+		"depends": { "acl": [ "luci-app-bitsxl" ] }
+	},
+	"admin/services/bitsxl/settings": {
+		"title": "Settings",
+		"order": 5,
+		"action": { "type": "view", "path": "bitsxl/settings" },
+		"depends": { "acl": [ "luci-app-bitsxl" ] }
+	}
+}
