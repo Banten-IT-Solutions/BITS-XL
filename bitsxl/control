@@ -1,5 +1,5 @@
 Package: bitsxl
-Version: 1.1.1
+Version: 1.2.0
 Depends: libc, python3-light, python3-urllib, python3-json, python3-hashlib, python3-ssl, ca-certificates
 Section: utils
 Architecture: all

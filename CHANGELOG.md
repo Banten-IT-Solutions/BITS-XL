@@ -1,3 +1,10 @@
+# [1.2.0](https://github.com/Banten-IT-Solutions/BITS-XL/compare/v1.1.1...v1.2.0) (2026-09-13)
+
+
+### Features
+
+* rewrite backend in Python (Networks-Bot structure) ([6946ab5](https://github.com/Banten-IT-Solutions/BITS-XL/commit/6946ab51a65f5b6bf86b1b83f18ce852d75236f2))
+
 ## [1.1.1](https://github.com/Banten-IT-Solutions/BITS-XL/compare/v1.1.0...v1.1.1) (2026-09-13)
 
 
