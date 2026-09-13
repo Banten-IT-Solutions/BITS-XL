@@ -43,6 +43,17 @@ function notifyResult(res, okText) {
 		ui.addNotification(null, E('p', {}, (res && (res.error || res.message)) || _('Command failed.')), 'warning');
 }
 
+function pageTitle(title) {
+	const main = document.getElementById('maincontent');
+	const tabmenu = document.getElementById('tabmenu');
+	if (!main || !tabmenu || main.querySelector('.bitsxl-page-title'))
+		return;
+	main.insertBefore(E('div', { 'class': 'bitsxl-page-title' }, [
+		E('h2', { 'name': 'content', 'style': 'margin:0 0 .35em' }, title),
+		E('div', { 'style': 'border-top:1px solid ' + SOFT_LINE + ';margin:0 0 1em' })
+	]), tabmenu);
+}
+
 function copyText(text, ev) {
 	if (ev) {
 		ev.preventDefault();
@@ -1574,6 +1585,7 @@ return view.extend({
 	},
 
 	render(results) {
+		pageTitle(_('Dashboard'));
 		const data = results[0] || {};
 		const accounts = {
 			lazy: true,
@@ -1611,8 +1623,8 @@ return view.extend({
 				...quotaPackageCards(quota, quotaError)
 			]) : '',
 			data.ok && !payloadErrors.length ? storeSegmentsPanel(data.subscription_type) : '',
-			data.ok ? transactionSummaryPanel() : '',
-			E('button', { 'class': 'btn cbi-button cbi-button-reload', 'click': () => window.location.reload() }, _('Refresh'))
+		data.ok ? transactionSummaryPanel() : '',
+		E('button', { 'class': 'btn cbi-button cbi-button-reload', 'style': 'margin-top:1em', 'click': () => window.location.reload() }, _('Refresh'))
 		]);
 	},
 

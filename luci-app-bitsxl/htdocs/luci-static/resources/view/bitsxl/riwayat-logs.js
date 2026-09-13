@@ -17,6 +17,17 @@ function callBitsxl(args) {
 	return L.resolveDefault(fs.exec_direct(BIN, args, 'json'), { ok: false, error: _('Unable to execute bitsxl') });
 }
 
+function pageTitle(title) {
+	const main = document.getElementById('maincontent');
+	const tabmenu = document.getElementById('tabmenu');
+	if (!main || !tabmenu || main.querySelector('.bitsxl-page-title'))
+		return;
+	main.insertBefore(E('div', { 'class': 'bitsxl-page-title' }, [
+		E('h2', { 'name': 'content', 'style': 'margin:0 0 .35em' }, title),
+		E('div', { 'style': 'border-top:1px solid ' + SOFT_LINE + ';margin:0 0 1em' })
+	]), tabmenu);
+}
+
 function logText(value) {
 	if (value == null)
 		return '';
@@ -759,8 +770,8 @@ function transactionHistoryPage(data) {
 				E('div', { 'style': 'margin-top:.25em;color:inherit;opacity:.65' }, _('Transaction History'))
 			]),
 			E('div', { 'style': 'display:flex;gap:.45em;flex-wrap:wrap' }, [
-				E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'click': showPendingTransactions }, _('Pending Payments')),
-				E('button', { 'class': 'btn cbi-button cbi-button-reload', 'click': () => window.location.reload() }, _('Refresh'))
+			E('button', { 'class': 'btn cbi-button cbi-button-neutral', 'click': showPendingTransactions }, _('Pending Payments')),
+			E('button', { 'class': 'btn cbi-button cbi-button-reload', 'style': 'margin-top:1em', 'click': () => window.location.reload() }, _('Refresh'))
 			])
 		]),
 		responsePanel(data),
@@ -777,9 +788,9 @@ function paymentLogsPage() {
 				E('h2', { 'style': 'margin:0' }, _('Riwayat')),
 				E('div', { 'style': 'margin-top:.25em;color:inherit;opacity:.65' }, _('Logs'))
 			]),
-			E('button', { 'class': 'btn cbi-button cbi-button-reload', 'click': () => window.location.reload() }, _('Refresh'))
-		]),
-		logs.length ? E('div', {}, logs.map(paymentLogCard)) : E('div', { 'class': 'alert-message warning', 'style': 'margin-top:1em' }, _('No payment logs.'))
+		E('button', { 'class': 'btn cbi-button cbi-button-reload', 'style': 'margin-top:1em', 'click': () => window.location.reload() }, _('Refresh'))
+	]),
+	logs.length ? E('div', {}, logs.map(paymentLogCard)) : E('div', { 'class': 'alert-message warning', 'style': 'margin-top:1em' }, _('No payment logs.'))
 	]);
 }
 
@@ -797,6 +808,7 @@ return view.extend({
 
 	render(data) {
 		const mode = currentMode();
+		pageTitle(mode === 'logs' ? _('Logs') : (mode === 'quota-history' ? _('Kuota History') : _('Transaction History')));
 		return mode === 'logs' ? paymentLogsPage() : (mode === 'quota-history' ? quotaHistoryPage(data) : transactionHistoryPage(data));
 	},
 

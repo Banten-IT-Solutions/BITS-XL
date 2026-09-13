@@ -11,6 +11,17 @@ function callBitsxl(args) {
 	return L.resolveDefault(fs.exec_direct(BIN, args, 'json'), { ok: false, error: _('Unable to execute bitsxl') });
 }
 
+function pageTitle(title) {
+	const main = document.getElementById('maincontent');
+	const tabmenu = document.getElementById('tabmenu');
+	if (!main || !tabmenu || main.querySelector('.bitsxl-page-title'))
+		return;
+	main.insertBefore(E('div', { 'class': 'bitsxl-page-title' }, [
+		E('h2', { 'name': 'content', 'style': 'margin:0 0 .35em' }, title),
+		E('div', { 'style': 'border-top:1px solid ' + SOFT_LINE + ';margin:0 0 1em' })
+	]), tabmenu);
+}
+
 function notificationList(payload) {
 	const roots = [ payload, payload && payload.notifications, payload && payload.response ];
 
@@ -170,6 +181,7 @@ return view.extend({
 	},
 
 	render(data) {
+		pageTitle(_('Notifikasi'));
 		const items = notificationList(data);
 		const ids = unreadIds(items);
 		const unread = items.filter((item) => !notificationRead(item)).length;
@@ -181,8 +193,8 @@ return view.extend({
 					E('div', { 'style': 'margin-top:.25em;color:inherit;opacity:.65' }, _('Total') + ': ' + items.length + ' · ' + _('Unread') + ': ' + unread)
 				]),
 				E('div', { 'style': 'display:flex;gap:.45em;flex-wrap:wrap' }, [
-					ids.length ? E('button', { 'class': 'btn cbi-button cbi-button-action', 'click': () => markRead(ids) }, _('Read All Unread')) : '',
-					E('button', { 'class': 'btn cbi-button cbi-button-reload', 'click': () => window.location.reload() }, _('Refresh'))
+				ids.length ? E('button', { 'class': 'btn cbi-button cbi-button-action', 'click': () => markRead(ids) }, _('Read All Unread')) : '',
+				E('button', { 'class': 'btn cbi-button cbi-button-reload', 'style': 'margin-top:1em', 'click': () => window.location.reload() }, _('Refresh'))
 				])
 			]),
 			errorMessage(data),

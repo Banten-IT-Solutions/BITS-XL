@@ -56,6 +56,17 @@ function callBitsxl(args) {
 	return L.resolveDefault(fs.exec_direct(BIN, args, 'json'), { ok: false, error: _('Unable to execute bitsxl') });
 }
 
+function pageTitle(title) {
+	const main = document.getElementById('maincontent');
+	const tabmenu = document.getElementById('tabmenu');
+	if (!main || !tabmenu || main.querySelector('.bitsxl-page-title'))
+		return;
+	main.insertBefore(E('div', { 'class': 'bitsxl-page-title' }, [
+		E('h2', { 'name': 'content', 'style': 'margin:0 0 .35em' }, title),
+		E('div', { 'style': 'border-top:1px solid ' + SOFT_LINE + ';margin:0 0 1em' })
+	]), tabmenu);
+}
+
 function notifyResult(res, okText) {
 	if (res && res.ok)
 		ui.addNotification(null, E('p', {}, okText || _('Done.')), 'info');
@@ -1771,6 +1782,7 @@ return view.extend({
 	},
 
 	render(data) {
+		pageTitle(_('Store'));
 		resetCartPointerDrag(false);
 		cartModalBox = null;
 		setStoreScopeFromRoute();
