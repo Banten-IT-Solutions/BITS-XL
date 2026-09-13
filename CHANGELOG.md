@@ -1,3 +1,10 @@
+## [1.2.6](https://github.com/Banten-IT-Solutions/BITS-XL/compare/v1.2.5...v1.2.6) (2026-09-13)
+
+
+### Bug Fixes
+
+* standard apk filename (name-version-r0.apk) for apk feed ([be85f0a](https://github.com/Banten-IT-Solutions/BITS-XL/commit/be85f0a223be4994e58fd6dc7c29edf087d130eb))
+
 ## [1.2.5](https://github.com/Banten-IT-Solutions/BITS-XL/compare/v1.2.4...v1.2.5) (2026-09-13)
 
 
